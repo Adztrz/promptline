@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.3
+// @version      3.3.1
 // @description  Promptline (formerly ChatGPT Image Queue): queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -656,7 +656,7 @@
   // chat selection bar, centred along the top of the page, wrapping by group rather than by button
   const bar = el('div', {
     position: 'fixed', top: '12px', left: '0', right: '0', margin: '0 auto', width: 'max-content', maxWidth: 'calc(100vw - 32px)',
-    zIndex: 100000, display: 'none', alignItems: 'center', columnGap: '14px', rowGap: '8px', flexWrap: 'wrap', boxSizing: 'border-box',
+    zIndex: 100000, display: 'none', flexDirection: 'column', gap: '6px', boxSizing: 'border-box',
     padding: '8px 10px 8px 14px', borderRadius: '10px', background: C.card, color: C.text, boxShadow: CARD_SHADOW, font: `400 13px/1.45 ${SANS}`,
   });
   bar.className = 'pl-root pl-bar';
@@ -674,9 +674,12 @@
   const bStopBatch = button('Stop');
   bStopBatch.style.display = 'none';
   const bDone = button('Done', 'primary');
-  const barNote = el('span', { fontSize: '12px', color: C.muted, flexBasis: '100%', display: 'none' });
+  // the hint sits under the controls and wraps to their width, so it never stretches the bar
+  const barNote = el('div', { fontSize: '12px', color: C.muted, display: 'none', width: '0', minWidth: '100%' });
   barNote.setAttribute('aria-live', 'polite');
-  bar.append(group(barTag, barCount), group(barFilter, bMatch), group(bAll, bNone), group(bArchive, bDelete, bStopBatch), group(bDone), barNote);
+  const barRow = el('div', { display: 'flex', alignItems: 'center', columnGap: '14px', rowGap: '8px', flexWrap: 'wrap' });
+  barRow.append(group(barTag, barCount), group(barFilter, bMatch), group(bAll, bNone), group(bArchive, bDelete, bStopBatch), group(bDone));
+  bar.append(barRow, barNote);
 
   document.body.append(toggle, panel, bar);
 
