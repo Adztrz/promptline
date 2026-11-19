@@ -2,13 +2,17 @@
 // @name         ChatGPT Image Queue
 // @namespace    adztrz
 // @license      MIT
-// @version      2.1
-// @description  Paste a list of prompts; each one is sent after the previous reply or image has finished.
+// @version      3.0
+// @description  Queue image prompts, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_notification
+// @grant        GM_download
+// @connect      chatgpt.com
+// @connect      oaiusercontent.com
+// @connect      openai.com
 // @run-at       document-idle
 // @homepageURL  https://github.com/Adztrz/chatgpt-image-queue
 // @updateURL    https://raw.githubusercontent.com/Adztrz/chatgpt-image-queue/main/chatgpt-prompt-queue.user.js
@@ -23,6 +27,11 @@
     gapMs: 5000,                // extra pause between prompts
     startWaitMs: 30000,         // how long to wait for ChatGPT to start replying after a send
     maxWaitMs: 8 * 60 * 1000,   // a reply taking longer than this pauses the queue
+    limitDefaultMs: 30 * 60 * 1000, // wait this long when a limit message gives no time
+    limitBufferMs: 60 * 1000,   // extra wait after the time a limit message gives
+    limitMaxMs: 12 * 60 * 60 * 1000,
+    minImagePx: 400,            // smaller images (avatars, icons) are never counted or downloaded
+    batchGapMs: 250,            // pause between chats in a batch archive or delete
   };
 
   // ChatGPT changes its page now and then; if the queue stops sending, these are the first thing to check.
@@ -32,33 +41,52 @@
     send: ['button[data-testid="send-button"]', 'button#composer-submit-button', 'button[aria-label="Send prompt"]', 'button[aria-label*="Send"]'],
     stop: 'button[data-testid="stop-button"], button[aria-label^="Stop"]',
     turn: '[data-message-author-role="assistant"]',
+    chat: 'nav a[href*="/c/"]',  // a chat in the sidebar
   };
   const BUSY_TEXT = /creating image|generating image|image creation in progress/i;
-  const LIMIT_TEXT = /(hit|reached) (the|your) .*limit|rate limit|too many requests/i;
+  const LIMIT_TEXT = /(hit|reached) (the|your|our) .*limit|rate limit|too many requests/i;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const $ = (s) => document.querySelector(s);
   const visible = (e) => !!e && e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
-  const first = (list) => { for (const s of list) for (const e of document.querySelectorAll(s)) if (visible(e) && !panel.contains(e)) return e; return null; };
+  const ours = (e) => panel.contains(e) || bar.contains(e);
+  const first = (list) => { for (const s of list) for (const e of document.querySelectorAll(s)) if (visible(e) && !ours(e)) return e; return null; };
   const findInput = () => first(SEL.input);
   const findSend = () => first(SEL.send);
   const boxText = (box) => (box.isContentEditable ? box.innerText : box.value).trim();
   const lastTurn = () => { const t = document.querySelectorAll(SEL.turn); return t[t.length - 1] || null; };
   const turnCount = () => document.querySelectorAll(SEL.turn).length;
+  const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 
   // ---------- state (kept across reloads, but never auto-resumes) ----------
   const state = {
     queue: GM_getValue('queue', []),
     idx: GM_getValue('idx', 0),
+    got: GM_getValue('got', []),  // queue positions whose images were already collected
     running: false,
+    limitSeenAt: 0,               // turn count when the last limit message was handled
     note: '',
     bad: false,
   };
   if (GM_getValue('running', false)) state.note = 'Paused because the page reloaded. Press Start to continue.';
-  const save = () => { GM_setValue('queue', state.queue); GM_setValue('idx', state.idx); GM_setValue('running', state.running); };
+  const save = () => { GM_setValue('queue', state.queue); GM_setValue('idx', state.idx); GM_setValue('got', state.got); GM_setValue('running', state.running); };
+
+  const settings = { download: true, prefix: '', autoResume: true, notify: true, ...GM_getValue('settings', {}) };
+  const saveSettings = () => GM_setValue('settings', settings);
+  let library = GM_getValue('library', []);  // [{ name, text }]
+  const saveLibrary = () => GM_setValue('library', library);
 
   // One prompt per line; "1. " or "1) " numbering is removed.
   const parse = (text) => text.split('\n').map((l) => l.replace(/^\s*\d+[.)]\s+/, '').trim()).filter(Boolean);
+
+  // ---------- daily counter ----------
+  const today = () => new Date().toLocaleDateString('en-CA');
+  function daily() {
+    const d = GM_getValue('daily', null);
+    return d && d.day === today() ? d : { day: today(), sent: 0, images: 0, seen: [], resetAt: 0 };
+  }
+  function updateDaily(fn) { const d = daily(); fn(d); GM_setValue('daily', d); renderToday(); }
 
   // ---------- page checks ----------
   function busy() {
@@ -68,7 +96,10 @@
     if (BUSY_TEXT.test(t.innerText || '')) return true;
     return [...t.querySelectorAll('img')].some((img) => !img.complete);
   }
-  const limitHit = () => LIMIT_TEXT.test((lastTurn() || {}).innerText || '');
+  // only a limit message that arrived after the last one we handled counts
+  const limitHit = () => turnCount() > state.limitSeenAt && LIMIT_TEXT.test((lastTurn() || {}).innerText || '');
+  const bigImages = (turn) => [...new Set([...turn.querySelectorAll('img')]
+    .filter((i) => i.complete && i.naturalWidth >= CFG.minImagePx).map((i) => i.currentSrc || i.src))];
 
   async function waitFor(fn, ms) {
     const end = Date.now() + ms;
@@ -130,31 +161,98 @@
     return boxText(box).includes(text.slice(0, 40)) ? "Text is in the chat box, but the send button wasn't found." : '';
   }
 
+  // ---------- downloads ----------
+  const slug = (t) => t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').split('-').slice(0, 6).join('-').slice(0, 40);
+  const fileName = (i, k) => `${settings.prefix.replace(/[\\/:*?"<>|]+/g, '-')}${String(i + 1).padStart(3, '0')}-${slug(state.queue[i] || '') || 'image'}${k ? `-${k + 1}` : ''}.png`;
+
+  function download(url, name) {
+    // the page's own fetch carries the ChatGPT sign-in, so it is the fallback when GM_download is refused
+    const viaPage = async () => {
+      try {
+        const blob = await (await fetch(url, { credentials: 'include' })).blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob); a.download = name;
+        document.body.append(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      } catch (_) { setStatus(`Couldn't download ${name}.`, true); }
+    };
+    try { GM_download({ url, name, saveAs: false, onerror: viaPage }); } catch (_) { viaPage(); }
+  }
+
+  // After prompt i has finished, save the images in the last reply once.
+  function collect(i) {
+    if (i < 0 || state.got.includes(i)) return;
+    state.got.push(i); save();
+    const t = lastTurn();
+    if (!t) return;
+    countImages(t);
+    if (settings.download) bigImages(t).forEach((src, k) => download(src, fileName(i, k)));
+  }
+
+  // ---------- limits ----------
+  // "resets in 2 hours and 33 minutes", "try again in 45 minutes", "after 3:40 PM"
+  function limitWait(text) {
+    let ms = 0;
+    for (const [, n, u] of text.matchAll(/(\d+)\s*(hour|hr|minute|min|second|sec)/gi)) ms += n * { h: 3600e3, m: 60e3, s: 1e3 }[u[0].toLowerCase()];
+    if (!ms) {
+      const m = text.match(/\b(\d{1,2}):(\d{2})\s*([AP]M)?/i);
+      if (m) {
+        const at = new Date();
+        let h = +m[1];
+        if (m[3]) h = (h % 12) + (/p/i.test(m[3]) ? 12 : 0);
+        at.setHours(h, +m[2], 0, 0);
+        if (at <= Date.now()) at.setDate(at.getDate() + 1);
+        ms = at - Date.now();
+      }
+    }
+    return Math.min((ms || CFG.limitDefaultMs) + CFG.limitBufferMs, CFG.limitMaxMs);
+  }
+
+  async function countdown(until) {
+    while (state.running && Date.now() < until) {
+      setStatus(`Limit hit. Resuming in ${plural(Math.ceil((until - Date.now()) / 60000), 'min')} (around ${clock(until)}). Keep this tab open.`);
+      await sleep(5000);
+    }
+    return state.running;
+  }
+
   // ---------- the queue ----------
   async function run() {
-    while (state.running && state.idx < state.queue.length) {
+    state.limitSeenAt = turnCount();  // a limit message already on the page is old news
+    while (state.running) {
       const idle = await waitIdle();
-      if (!state.running) break;
+      if (!state.running) return;
       if (!idle) return pause('The last reply took too long. Check the page, then press Start.');
-      if (limitHit()) return pause('ChatGPT says you hit a limit. Paused.');
+      if (limitHit()) {
+        state.limitSeenAt = turnCount();
+        // the last prompt got the limit message instead of an image, so it goes again
+        if (state.idx > 0) { state.idx--; state.got = state.got.filter((g) => g !== state.idx); save(); render(); }
+        const until = Date.now() + limitWait(lastTurn().innerText || '');
+        updateDaily((d) => { d.resetAt = until; });
+        if (!settings.autoResume) return pause(`ChatGPT says you hit a limit. Try again around ${clock(until)}.`);
+        notify(`Limit hit. The queue resumes around ${clock(until)}.`);
+        if (!(await countdown(until))) break;
+        notify('Limit wait is over. Resuming the queue.');
+        continue;
+      }
+      collect(state.idx - 1);
+      if (state.idx >= state.queue.length) break;
       setStatus('Next prompt in a moment…');
       await sleep(CFG.gapMs);
-      if (!state.running) break;
+      if (!state.running) return;
 
       const before = turnCount();
       const err = await sendPrompt(state.queue[state.idx]);
       if (err) return pause(`${err} Press Check and tell Claude what it says.`);
       state.idx++; save(); render();
+      updateDaily((d) => { d.sent++; });
       setStatus(`Sent ${state.idx} of ${state.queue.length}. Waiting for the reply…`);
       await waitFor(() => !state.running || busy() || turnCount() > before, CFG.startWaitMs);
     }
-    if (state.running && state.idx >= state.queue.length) {
-      // let the last image finish before calling it done
-      await waitIdle();
-      state.running = false; save(); render();
-      setStatus(`Done: all ${state.queue.length} prompts sent.`);
-      notify('All prompts sent.');
-    }
+    if (!state.running) return;
+    state.running = false; save(); render();
+    setStatus(`Done: all ${state.queue.length} prompts sent.`);
+    notify(`Done: all ${state.queue.length} prompts sent.`);
   }
 
   function pause(msg, bad = true) {
@@ -163,8 +261,24 @@
     if (bad) notify(msg);
   }
   function notify(text) {
-    try { GM_notification({ title: 'Image queue', text, timeout: 8000 }); } catch (_) { /* notifications off */ }
+    if (!settings.notify) return;
+    try { GM_notification({ title: 'Image queue', text, timeout: 10000, onclick: () => window.focus() }); }
+    catch (_) { try { new Notification('Image queue', { body: text }); } catch (__) { /* notifications off */ } }
   }
+
+  // Count every image ChatGPT finishes while this tab watches it being made, queued or not.
+  // The queue also counts each reply it collects, so a fast image between two checks isn't missed.
+  const liveTurns = new WeakSet();
+  function countImages(t) {
+    const fresh = bigImages(t).filter((s) => !daily().seen.includes(s));
+    if (fresh.length) updateDaily((d) => { d.images += fresh.length; d.seen = [...d.seen, ...fresh].slice(-300); });
+  }
+  setInterval(() => {
+    const t = lastTurn();
+    if (!t) return;
+    if (busy()) liveTurns.add(t);
+    else if (liveTurns.has(t)) countImages(t);
+  }, 2000);
 
   // ---------- panel: Faust's look (near-black cards, hairlines, bone primary, uppercase tags with a dot) ----------
   // Built without innerHTML and styled in JS, so ChatGPT's page rules don't block it.
@@ -179,6 +293,7 @@
 
   const el = (tag, style, text) => { const e = document.createElement(tag); Object.assign(e.style, style || {}); if (text) e.textContent = text; return e; };
   const hover = (e, on, off) => { e.addEventListener('mouseenter', () => !e.disabled && Object.assign(e.style, on)); e.addEventListener('mouseleave', () => Object.assign(e.style, off)); };
+  const dim = (...bs) => { for (const b of bs) { b.style.opacity = b.disabled ? '.4' : '1'; b.style.cursor = b.disabled ? 'default' : 'pointer'; } };
 
   // buttons: 32px, 8px corners, hairline edge; the one primary action is bone
   function button(label, kind = 'plain') {
@@ -191,11 +306,13 @@
       plain: { background: 'transparent', border: `1px solid ${C.border}`, color: C.strong },
       primary: { background: C.bone, border: `1px solid ${C.bone}`, color: C.canvas, boxShadow: '0 1px 3px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.5)' },
       ghost: { background: 'transparent', border: '1px solid transparent', color: C.muted, padding: '0 8px' },
+      danger: { background: 'transparent', border: `1px solid ${C.alert}`, color: C.alert },
     }[kind];
     const b = el('button', { ...base, ...look }, label);
     b.type = 'button';
     if (kind === 'primary') hover(b, { background: C.strong, borderColor: C.strong }, { background: C.bone, borderColor: C.bone });
-    else if (kind === 'ghost') hover(b, { color: C.strong, borderColor: C.border }, { color: C.muted, borderColor: 'transparent' });
+    else if (kind === 'ghost') hover(b, { color: C.strong, borderColor: C.border }, { color: b.active ? C.strong : C.muted, borderColor: 'transparent' });
+    else if (kind === 'danger') hover(b, { background: 'rgba(241,38,20,.1)' }, { background: 'transparent' });
     else hover(b, { borderColor: C.rule, background: 'rgba(255,255,255,.03)' }, { borderColor: C.border, background: 'transparent' });
     return b;
   }
@@ -208,6 +325,19 @@
     return t;
   }
   const pulse = (e) => e.animate([{ opacity: 1 }, { opacity: .25 }, { opacity: 1 }], { duration: 1600, iterations: Infinity, easing: 'ease-in-out' });
+  const fieldStyle = {
+    width: '100%', boxSizing: 'border-box', padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`,
+    background: C.raised, color: C.strong, font: `400 12px/1.55 ${MONO}`, outline: 'none', transition: `border-color .15s ${EASE}`,
+  };
+  function field(tagName, placeholder, style) {
+    const f = el(tagName, { ...fieldStyle, ...style });
+    f.placeholder = placeholder;
+    f.addEventListener('focus', () => { f.style.borderColor = C.rule; });
+    f.addEventListener('blur', () => { f.style.borderColor = C.border; });
+    // typing in our fields must not reach ChatGPT's own shortcuts
+    f.addEventListener('keydown', (e) => e.stopPropagation());
+    return f;
+  }
 
   // the launcher: a quiet button with the progress in it
   const toggle = button('', 'plain');
@@ -216,6 +346,7 @@
   const toggleTag = tag('Queue', C.bone, C.strong);
   const toggleCount = el('span', { font: `500 12px/1 ${MONO}`, color: C.muted });
   toggle.append(toggleTag, toggleCount);
+  toggle.title = 'Image queue (Alt+Q)';
 
   const panel = el('div', {
     position: 'fixed', right: '16px', bottom: '138px', zIndex: 99999, width: '412px', maxWidth: 'calc(100vw - 32px)', boxSizing: 'border-box',
@@ -223,21 +354,25 @@
   });
 
   // header: tag on the left, count pill on the right
-  const header = el('div', { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px' });
+  const header = el('div', { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' });
   const headTag = tag('Image queue');
   const pill = el('span', { minWidth: '20px', padding: '2px 8px', borderRadius: '9999px', background: 'rgba(255,255,255,.05)', font: `500 11px/1.4 ${MONO}`, color: C.muted, textAlign: 'center' });
   header.append(headTag, pill);
 
+  // today's numbers, under the header
+  const todayLine = el('div', { font: `500 11px/1.4 ${MONO}`, color: C.faint, marginBottom: '12px' });
+
+  // tabs
+  const tabs = el('div', { display: 'flex', gap: '2px', alignItems: 'center', margin: '0 -8px 14px', borderBottom: `1px solid ${C.divider}`, paddingBottom: '8px' });
+  const tabBtns = { queue: button('Queue', 'ghost'), library: button('Library', 'ghost'), settings: button('Settings', 'ghost') };
+  const bSelect = button('Select chats', 'ghost');
+  bSelect.title = 'Pick chats in the sidebar to archive or delete (Alt+X)';
+  tabs.append(tabBtns.queue, tabBtns.library, tabBtns.settings, el('span', { flex: '1' }), bSelect);
+  let tab = 'queue';
+
   // edit view: paste prompts, see how many were found
   const editView = el('div');
-  const area = el('textarea', {
-    width: '100%', height: '150px', boxSizing: 'border-box', resize: 'vertical', padding: '10px 12px', borderRadius: '8px',
-    border: `1px solid ${C.border}`, background: C.raised, color: C.strong, font: `400 12px/1.55 ${MONO}`, outline: 'none',
-    transition: `border-color .15s ${EASE}`,
-  });
-  area.placeholder = 'Paste prompts, one per line.\n1. A single red rose…\n2. Three pastel eggs…';
-  area.addEventListener('focus', () => { area.style.borderColor = C.rule; });
-  area.addEventListener('blur', () => { area.style.borderColor = C.border; });
+  const area = field('textarea', 'Paste prompts, one per line.\n1. A single red rose…\n2. Three pastel eggs…', { height: '150px', resize: 'vertical', padding: '10px 12px' });
   const found = el('div', { margin: '8px 0 14px', fontSize: '12px', color: C.muted });
   const editRow = el('div', { display: 'flex', gap: '8px', justifyContent: 'flex-end' });
   const bCancel = button('Cancel', 'ghost');
@@ -247,28 +382,101 @@
 
   // queue view: each prompt is its own card, spaced apart
   const queueView = el('div');
-  const list = el('ol', { listStyle: 'none', margin: '0 -4px 0 0', padding: '0 4px 0 0', display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '46vh', overflowY: 'auto' });
+  const list = el('ol', { listStyle: 'none', margin: '0 -4px 0 0', padding: '0 4px 0 0', display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '42vh', overflowY: 'auto' });
   const status = el('div', { margin: '14px 0', minHeight: '18px', fontSize: '12px', lineHeight: '1.4', color: C.muted });
   const row = el('div', { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' });
   const bStart = button('Start', 'primary');
+  bStart.title = 'Start (Alt+S)';
   const bPause = button('Pause');
+  bPause.title = 'Pause (Alt+S)';
   const bSkip = button('Skip');
   bSkip.title = 'Skip the next prompt';
-  const spacer = el('span', { flex: '1' });
   const bEdit = button('Edit', 'ghost');
   const bCheck = button('Check', 'ghost');
   bCheck.title = 'Show what the script can find on this page';
   const bClear = button('Clear', 'ghost');
-  row.append(bStart, bPause, bSkip, spacer, bEdit, bCheck, bClear);
+  row.append(bStart, bPause, bSkip, el('span', { flex: '1' }), bEdit, bCheck, bClear);
   queueView.append(list, status, row);
 
-  panel.append(header, editView, queueView);
-  document.body.append(toggle, panel);
+  // library view: saved prompts to insert into the chat box or add to the queue
+  const libView = el('div');
+  const libTop = el('div', { display: 'flex', gap: '8px', marginBottom: '10px' });
+  const libSearch = field('input', 'Search saved prompts (Enter inserts the first)', { flex: '1' });
+  const bNewSnip = button('New');
+  libTop.append(libSearch, bNewSnip);
+  const libForm = el('div', { display: 'none', flexDirection: 'column', gap: '8px', padding: '12px', borderRadius: '8px', boxShadow: `inset 0 0 0 1px ${C.rule}`, marginBottom: '10px' });
+  const snipName = field('input', 'Name, e.g. Realistic landscape style');
+  const snipText = field('textarea', 'The prompt text. Several lines become several queue prompts.', { height: '90px', resize: 'vertical' });
+  const libFormRow = el('div', { display: 'flex', gap: '8px', justifyContent: 'flex-end' });
+  const bSnipCancel = button('Cancel', 'ghost');
+  const bSnipSave = button('Save', 'primary');
+  libFormRow.append(bSnipCancel, bSnipSave);
+  libForm.append(snipName, snipText, libFormRow);
+  const libList = el('ol', { listStyle: 'none', margin: '0 -4px 0 0', padding: '0 4px 0 0', display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '42vh', overflowY: 'auto' });
+  const libNote = el('div', { marginTop: '10px', minHeight: '18px', fontSize: '12px', color: C.muted });
+  libView.append(libTop, libForm, libList, libNote);
+  let snipEditing = -1;
+
+  // settings view
+  const setView = el('div', { display: 'flex', flexDirection: 'column', gap: '12px' });
+  function checkRow(key, label, hint) {
+    const r = el('label', { display: 'grid', gridTemplateColumns: '18px 1fr', gap: '2px 10px', cursor: 'pointer', alignItems: 'start' });
+    const c = el('input', { margin: '2px 0 0', accentColor: C.bone, width: '16px', height: '16px' });
+    c.type = 'checkbox'; c.checked = settings[key];
+    c.onchange = () => { settings[key] = c.checked; saveSettings(); };
+    r.append(c, el('span', { color: C.strong }, label), el('span'), el('span', { fontSize: '12px', color: C.muted }, hint));
+    return r;
+  }
+  const prefixLabel = el('div', { color: C.strong }, 'File name prefix');
+  const prefixInput = field('input', 'e.g. cozy-  →  cozy-001-a-small-wooden-cabin.png');
+  prefixInput.value = settings.prefix;
+  prefixInput.oninput = () => { settings.prefix = prefixInput.value; saveSettings(); };
+  const bTestNote = button('Test notification');
+  bTestNote.onclick = () => { const was = settings.notify; settings.notify = true; notify('Notifications work.'); settings.notify = was; };
+  const keys = el('div', { font: `400 12px/1.7 ${MONO}`, color: C.muted, whiteSpace: 'pre' },
+    'Alt+Q  open or close this panel\nAlt+S  start or pause the queue\nAlt+X  select chats in the sidebar\nAlt+L  prompt library\nEsc    leave chat selection');
+  const testRow = el('div', { display: 'flex' });
+  testRow.append(bTestNote);
+  setView.append(
+    checkRow('download', 'Download images automatically', 'Each image is saved as soon as its prompt finishes, named by queue number and prompt.'),
+    prefixLabel, prefixInput,
+    checkRow('autoResume', 'Wait out limits and resume', 'When ChatGPT says you hit a limit, wait until it resets, then send that prompt again.'),
+    checkRow('notify', 'Desktop notifications', 'When the queue finishes, pauses, or waits on a limit.'),
+    testRow, keys,
+  );
+
+  panel.append(header, todayLine, tabs, editView, queueView, libView, setView);
+
+  // chat selection bar, along the top of the page
+  const bar = el('div', {
+    position: 'fixed', top: '12px', left: '50%', transform: 'translateX(-50%)', zIndex: 100000, display: 'none', alignItems: 'center', gap: '6px',
+    flexWrap: 'wrap', maxWidth: 'calc(100vw - 32px)', boxSizing: 'border-box', padding: '10px 12px', borderRadius: '8px',
+    background: C.card, color: C.text, boxShadow: CARD_SHADOW, font: `400 13px/1.45 ${SANS}`,
+  });
+  const barTag = tag('Select chats', C.bone, C.strong);
+  const barCount = el('span', { font: `500 12px/1 ${MONO}`, color: C.muted, margin: '0 6px' });
+  const barFilter = field('input', 'Title contains…', { width: '150px', padding: '6px 10px' });
+  const bMatch = button('Select matching', 'ghost');
+  const bAll = button('All', 'ghost');
+  const bNone = button('None', 'ghost');
+  const bArchive = button('Archive');
+  const bDelete = button('Delete', 'danger');
+  const bDone = button('Done', 'primary');
+  const barNote = el('span', { fontSize: '12px', color: C.muted, flexBasis: '100%', display: 'none' });
+  bar.append(barTag, barCount, barFilter, bMatch, bAll, bNone, bArchive, bDelete, bDone, barNote);
+
+  document.body.append(toggle, panel, bar);
 
   let editing = !state.queue.length;
   let pulseAnim = null;
 
   function setStatus(t, bad = false) { state.note = t; state.bad = bad; status.textContent = t; status.style.color = bad ? C.alert : C.muted; }
+
+  function renderToday() {
+    const d = daily();
+    const reset = d.resetAt > Date.now() ? `  ·  limit resets ~${clock(d.resetAt)}` : '';
+    todayLine.textContent = `Today  ${plural(d.sent, 'prompt')} sent  ·  ${plural(d.images, 'image')}${reset}`;
+  }
 
   function card(text, i) {
     const sent = i < state.idx, next = i === state.idx, working = state.running && i === state.idx - 1;
@@ -279,18 +487,21 @@
     });
     const num = el('span', { gridRow: 'span 2', font: `500 12px/18px ${MONO}`, color: next ? C.strong : C.faint }, String(i + 1).padStart(2, '0'));
     const label = working ? tag('Generating', C.bone, C.strong)
-      : sent ? tag('Sent', C.positive)
+      : sent ? tag(state.got.includes(i) && settings.download ? 'Saved' : 'Sent', C.positive)
       : next ? tag(state.running ? 'Up next' : 'Next', C.bone, C.strong)
       : tag('Queued', C.faint, C.faint);
     if (working) pulseAnim = pulse(label.dot);
-    const body = el('p', {
-      margin: '0', color: sent ? C.muted : C.text, fontSize: '13px', lineHeight: '1.5', overflowWrap: 'anywhere',
-      display: '-webkit-box', WebkitLineClamp: '3', WebkitBoxOrient: 'vertical', overflow: 'hidden', cursor: 'pointer',
-    }, text);
-    body.title = 'Click to show or hide the whole prompt';
-    body.onclick = () => { const open = body.style.webkitLineClamp === 'unset'; body.style.webkitLineClamp = open ? '3' : 'unset'; };
-    li.append(num, label, body);
+    li.append(num, label, clampText(text, sent ? C.muted : C.text, 3));
     return li;
+  }
+  function clampText(text, color, lines) {
+    const p = el('p', {
+      margin: '0', color, fontSize: '13px', lineHeight: '1.5', overflowWrap: 'anywhere',
+      display: '-webkit-box', WebkitLineClamp: String(lines), WebkitBoxOrient: 'vertical', overflow: 'hidden', cursor: 'pointer',
+    }, text);
+    p.title = 'Click to show or hide the whole text';
+    p.onclick = () => { p.style.webkitLineClamp = p.style.webkitLineClamp === 'unset' ? String(lines) : 'unset'; };
+    return p;
   }
 
   function render() {
@@ -299,35 +510,97 @@
     toggleCount.textContent = n ? `${state.idx}/${n}` : '';
     toggleTag.dot.style.background = state.running ? C.positive : C.bone;
 
-    editView.style.display = editing ? 'block' : 'none';
-    queueView.style.display = editing ? 'none' : 'block';
+    for (const [k, b] of Object.entries(tabBtns)) { b.active = k === tab; b.style.color = b.active ? C.strong : C.muted; }
+    bSelect.style.color = sel.on ? C.strong : C.muted;
+    editView.style.display = tab === 'queue' && editing ? 'block' : 'none';
+    queueView.style.display = tab === 'queue' && !editing ? 'block' : 'none';
+    libView.style.display = tab === 'library' ? 'block' : 'none';
+    setView.style.display = tab === 'settings' ? 'flex' : 'none';
+
     bCancel.style.display = n ? 'inline-flex' : 'none';
     const cnt = parse(area.value).length;
-    found.textContent = cnt ? `${cnt} prompt${cnt === 1 ? '' : 's'} found` : 'One prompt per line. Numbers like "1." are removed.';
+    found.textContent = cnt ? `${plural(cnt, 'prompt')} found` : 'One prompt per line. Numbers like "1." are removed.';
     bLoad.disabled = !cnt;
 
     if (pulseAnim) { pulseAnim.cancel(); pulseAnim = null; }
     list.replaceChildren(...state.queue.map(card));
     const cur = list.children[Math.min(state.idx, n - 1)];
-    if (cur && panel.style.display !== 'none') cur.scrollIntoView({ block: 'nearest' });
+    if (cur && panel.style.display !== 'none' && tab === 'queue') cur.scrollIntoView({ block: 'nearest' });
 
     bStart.textContent = state.running ? 'Running' : state.idx > 0 && state.idx < n ? 'Resume' : 'Start';
     bStart.disabled = state.running || state.idx >= n;
     bPause.disabled = !state.running;
     bSkip.disabled = state.running || state.idx >= n;
     bEdit.disabled = bClear.disabled = state.running;
-    for (const b of [bLoad, bStart, bPause, bSkip, bEdit, bClear]) { b.style.opacity = b.disabled ? '.4' : '1'; b.style.cursor = b.disabled ? 'default' : 'pointer'; }
+    dim(bLoad, bStart, bPause, bSkip, bEdit, bClear);
     setStatus(state.note || (n && state.idx >= n ? `Done: all ${n} prompts sent.` : n ? 'Ready. Leave the chat box alone while it runs.' : ''), state.bad);
+    renderToday();
+    if (tab === 'library') renderLibrary();
   }
 
-  toggle.onclick = () => { panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; render(); };
+  function renderLibrary() {
+    const q = libSearch.value.trim().toLowerCase();
+    const shown = library.map((s, i) => [s, i]).filter(([s]) => !q || `${s.name} ${s.text}`.toLowerCase().includes(q));
+    libList.replaceChildren(...shown.map(([s, i]) => {
+      const li = el('li', { display: 'flex', flexDirection: 'column', gap: '6px', padding: '12px 14px', borderRadius: '8px', boxShadow: `inset 0 0 0 1px ${C.divider}` });
+      const acts = el('div', { display: 'flex', gap: '4px', flexWrap: 'wrap', margin: '2px -8px -4px' });
+      const bIns = button('Insert', 'ghost'), bQ = button('Add to queue', 'ghost'), bEd = button('Edit', 'ghost'), bDel = button('Delete', 'ghost');
+      bIns.title = 'Put it in the chat box';
+      bIns.onclick = () => insertIntoChat(s.text);
+      bQ.onclick = () => addToQueue(s.text);
+      bEd.onclick = () => openSnipForm(i);
+      bDel.onclick = () => { if (confirm(`Delete "${s.name}" from the library?`)) { library.splice(i, 1); saveLibrary(); renderLibrary(); } };
+      acts.append(bIns, bQ, el('span', { flex: '1' }), bEd, bDel);
+      li.append(el('div', { color: C.strong, fontWeight: '500' }, s.name), clampText(s.text, C.text, 2), acts);
+      return li;
+    }));
+    if (!library.length) libNote.textContent = 'No saved prompts yet. Press New to add your favourite style lines and prompts.';
+    else if (!shown.length) libNote.textContent = 'Nothing matches that search.';
+    else if (!libNote.dataset.keep) libNote.textContent = '';
+  }
+  function libSay(t) { libNote.textContent = t; libNote.dataset.keep = '1'; setTimeout(() => { delete libNote.dataset.keep; }, 4000); }
+  function openSnipForm(i) {
+    snipEditing = i;
+    snipName.value = i >= 0 ? library[i].name : '';
+    snipText.value = i >= 0 ? library[i].text : '';
+    libForm.style.display = 'flex';
+    snipName.focus();
+  }
+  async function insertIntoChat(text) {
+    const box = findInput();
+    if (!box) return libSay("Couldn't find the chat box.");
+    const cur = boxText(box);
+    if (await fill(box, cur ? `${cur} ${text}` : text)) libSay('Inserted into the chat box.');
+    else libSay("Found the chat box, but the text didn't go in.");
+    box.focus();
+  }
+  function addToQueue(text) {
+    const l = parse(text);
+    if (!state.queue.length || state.idx >= state.queue.length) { state.queue = []; state.idx = 0; state.got = []; state.note = ''; }
+    state.queue.push(...l); save();
+    editing = false;
+    libSay(`Added ${plural(l.length, 'prompt')} to the queue.`);
+    render();
+  }
+
+  function openPanel(which) {
+    if (which) tab = which;
+    panel.style.display = 'block';
+    render();
+    if (tab === 'library') libSearch.focus();
+  }
+  function togglePanel() { if (panel.style.display === 'none') openPanel(); else panel.style.display = 'none'; }
+  function startOrPause() { if (state.running) bPause.onclick(); else bStart.onclick(); }
+
+  toggle.onclick = togglePanel;
+  for (const [k, b] of Object.entries(tabBtns)) b.onclick = () => openPanel(k);
   area.addEventListener('input', render);
   bLoad.onclick = () => {
     const l = parse(area.value);
     if (!l.length) return;
-    state.queue = l; state.idx = 0; state.note = ''; save();
+    state.queue = l; state.idx = 0; state.got = []; state.note = ''; save();
     editing = false; render();
-    setStatus(`Loaded ${l.length} prompts. Press Start.`);
+    setStatus(`Loaded ${plural(l.length, 'prompt')}. Press Start.`);
   };
   bCancel.onclick = () => { editing = false; render(); };
   bEdit.onclick = () => { if (state.running) return; area.value = state.queue.slice(state.idx).join('\n'); editing = true; render(); area.focus(); };
@@ -339,15 +612,169 @@
   };
   bPause.onclick = () => pause('Paused. Press Resume to continue from the next prompt.', false);
   bSkip.onclick = () => { if (!state.running && state.idx < state.queue.length) { state.idx++; save(); state.note = ''; render(); } };
-  bClear.onclick = () => { if (state.running) return; state.queue = []; state.idx = 0; state.note = ''; save(); area.value = ''; editing = true; render(); };
+  bClear.onclick = () => { if (state.running) return; state.queue = []; state.idx = 0; state.got = []; state.note = ''; save(); area.value = ''; editing = true; render(); };
   // Reports what the script can see, so a broken selector is easy to spot.
   bCheck.onclick = () => {
     const box = findInput(), send = findSend();
-    const all = [...document.querySelectorAll('[contenteditable="true"], textarea')].filter((e) => !panel.contains(e));
+    const all = [...document.querySelectorAll('[contenteditable="true"], textarea')].filter((e) => !ours(e));
     const desc = (e) => e ? `${e.tagName.toLowerCase()}${e.id ? '#' + e.id : ''}${e.isContentEditable ? ' (editable)' : ''}` : 'none';
-    setStatus(`Chat box: ${desc(box)}. Send button: ${send ? (send.getAttribute('data-testid') || send.getAttribute('aria-label') || 'found') + (send.disabled ? ' (disabled)' : '') : 'none'}. Editors on page: ${all.map(desc).join(', ') || 'none'}. Busy: ${busy() ? 'yes' : 'no'}.`);
+    setStatus(`Chat box: ${desc(box)}. Send button: ${send ? (send.getAttribute('data-testid') || send.getAttribute('aria-label') || 'found') + (send.disabled ? ' (disabled)' : '') : 'none'}. Editors on page: ${all.map(desc).join(', ') || 'none'}. Sidebar chats: ${chatLinks().length}. Busy: ${busy() ? 'yes' : 'no'}.`);
   };
+
+  libSearch.addEventListener('input', renderLibrary);
+  libSearch.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    const q = libSearch.value.trim().toLowerCase();
+    const hit = library.find((s) => !q || `${s.name} ${s.text}`.toLowerCase().includes(q));
+    if (hit) insertIntoChat(hit.text);
+  });
+  bNewSnip.onclick = () => openSnipForm(-1);
+  bSnipCancel.onclick = () => { libForm.style.display = 'none'; };
+  bSnipSave.onclick = () => {
+    const name = snipName.value.trim(), text = snipText.value.trim();
+    if (!text) return snipText.focus();
+    const s = { name: name || text.slice(0, 40), text };
+    if (snipEditing >= 0) library[snipEditing] = s; else library.unshift(s);
+    saveLibrary(); libForm.style.display = 'none'; renderLibrary();
+  };
+
+  // ---------- chat selection: tick chats in the sidebar, then archive or delete them together ----------
+  const sel = { on: false, ids: new Set(), last: null, busy: false };
+  const chatId = (a) => ((a.getAttribute('href') || '').match(/\/c\/([\w-]+)/) || [])[1];
+  const chatLinks = () => [...document.querySelectorAll(SEL.chat)].filter((a) => chatId(a) && visible(a) && !ours(a));
+
+  function paintLink(a) {
+    const on = sel.on && sel.ids.has(chatId(a));
+    let box = a.querySelector(':scope > [data-iq-box]');
+    if (sel.on && !box) {
+      box = el('span', {
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none', width: '16px', height: '16px', marginRight: '8px',
+        borderRadius: '4px', border: `1px solid ${C.rule}`, font: `700 11px/1 ${SANS}`, color: C.canvas, boxSizing: 'border-box',
+      });
+      box.dataset.iqBox = '1';
+      a.prepend(box);
+    }
+    if (!sel.on) { if (box) box.remove(); a.style.boxShadow = ''; a.style.background = ''; return; }
+    const mark = on ? '✓' : '';
+    if (box.textContent !== mark) box.textContent = mark;  // only when it changes, or the observer loops
+    box.style.background = on ? C.bone : 'transparent';
+    box.style.borderColor = on ? C.bone : C.rule;
+    a.style.boxShadow = on ? `inset 0 0 0 1px ${C.bone}` : '';
+    a.style.background = on ? 'rgba(233,225,220,.08)' : '';
+  }
+  let paintQueued = false;
+  function paintAll() {
+    if (paintQueued) return;
+    paintQueued = true;
+    // a microtask, not requestAnimationFrame, which stalls while the tab is in the background
+    queueMicrotask(() => { paintQueued = false; document.querySelectorAll(SEL.chat).forEach(paintLink); renderBar(); });
+  }
+  // the sidebar loads more chats as it scrolls, and React redraws links: tick boxes go on whatever appears
+  // (changes inside our own panel and bar are ignored, or repainting the bar would wake it again forever)
+  const watcher = new MutationObserver((recs) => { if (recs.some((r) => !ours(r.target))) paintAll(); });
+
+  function setSelect(on) {
+    sel.on = on;
+    say('');
+    if (!on) { sel.ids.clear(); sel.last = null; watcher.disconnect(); }
+    else watcher.observe(document.body, { childList: true, subtree: true });
+    bar.style.display = on ? 'flex' : 'none';
+    document.querySelectorAll(SEL.chat).forEach(paintLink);
+    renderBar(); render();
+    if (on && !chatLinks().length) say('No chats found in the sidebar. Open the sidebar first.');
+  }
+  function say(t) { barNote.textContent = t; barNote.style.display = t ? 'block' : 'none'; }
+  function renderBar() {
+    if (!sel.on) return;
+    const count = `${sel.ids.size} selected · ${chatLinks().length} loaded`;
+    if (barCount.textContent !== count) barCount.textContent = count;
+    bArchive.disabled = bDelete.disabled = !sel.ids.size || sel.busy;
+    bAll.disabled = bNone.disabled = bMatch.disabled = bDone.disabled = sel.busy;
+    dim(bArchive, bDelete, bAll, bNone, bMatch, bDone);
+  }
+
+  // in selection mode a click on a chat ticks it instead of opening it; Shift+click ticks a range
+  document.addEventListener('click', (e) => {
+    if (!sel.on || sel.busy) return;
+    const a = e.target.closest && e.target.closest(SEL.chat);
+    if (!a || ours(a)) return;
+    e.preventDefault(); e.stopPropagation();
+    const id = chatId(a), links = chatLinks().map(chatId);
+    if (e.shiftKey && sel.last && links.includes(sel.last)) {
+      const [i, j] = [links.indexOf(sel.last), links.indexOf(id)].sort((x, y) => x - y);
+      links.slice(i, j + 1).forEach((x) => sel.ids.add(x));
+    } else if (sel.ids.has(id)) sel.ids.delete(id);
+    else sel.ids.add(id);
+    sel.last = id;
+    say('');
+    paintAll();
+  }, true);
+
+  bSelect.onclick = () => setSelect(!sel.on);
+  bDone.onclick = () => setSelect(false);
+  bAll.onclick = () => { chatLinks().forEach((a) => sel.ids.add(chatId(a))); paintAll(); };
+  bNone.onclick = () => { sel.ids.clear(); paintAll(); };
+  bMatch.onclick = () => {
+    const q = barFilter.value.trim().toLowerCase();
+    if (!q) return barFilter.focus();
+    const hits = chatLinks().filter((a) => a.innerText.toLowerCase().includes(q));
+    hits.forEach((a) => sel.ids.add(chatId(a)));
+    say(`${plural(hits.length, 'loaded chat')} match "${barFilter.value.trim()}". Scroll the sidebar to load older chats.`);
+    paintAll();
+  };
+  barFilter.addEventListener('keydown', (e) => { if (e.key === 'Enter') bMatch.onclick(); });
+
+  async function token() {
+    const r = await fetch('/api/auth/session', { credentials: 'include' });
+    const j = await r.json();
+    if (!j.accessToken) throw new Error("couldn't read your ChatGPT sign-in");
+    return j.accessToken;
+  }
+  // Archive and delete go through the same private endpoint ChatGPT's own menu uses.
+  async function batch(kind) {
+    const ids = [...sel.ids];
+    if (!ids.length || sel.busy) return;
+    const verb = kind === 'delete' ? 'Delete' : 'Archive';
+    if (kind === 'delete' && !confirm(`Delete ${plural(ids.length, 'chat')}? Deleted chats can't be brought back. Archive keeps them under Settings → Archived chats.`)) return;
+    sel.busy = true; renderBar();
+    let ok = 0, fail = 0;
+    try {
+      const auth = await token();
+      for (const id of ids) {
+        say(`${verb === 'Delete' ? 'Deleting' : 'Archiving'} ${ok + fail + 1} of ${ids.length}…`);
+        const r = await fetch(`/backend-api/conversation/${id}`, {
+          method: 'PATCH', credentials: 'include',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${auth}` },
+          body: JSON.stringify(kind === 'delete' ? { is_visible: false } : { is_archived: true }),
+        });
+        if (r.ok) {
+          ok++; sel.ids.delete(id);
+          document.querySelectorAll(SEL.chat).forEach((a) => { if (chatId(a) === id) (a.closest('li') || a).style.display = 'none'; });
+        } else fail++;
+        await sleep(CFG.batchGapMs);
+      }
+      say(`${kind === 'delete' ? 'Deleted' : 'Archived'} ${plural(ok, 'chat')}${fail ? `; ${fail} failed (try again, or reload the page)` : ''}. Reload the page to refresh the sidebar.`);
+    } catch (e) {
+      say(`Stopped after ${plural(ok, 'chat')}: ${e && e.message ? e.message : e}.`);
+    }
+    sel.busy = false; paintAll();
+    if (ids.length >= 10) notify(`${kind === 'delete' ? 'Deleted' : 'Archived'} ${plural(ok, 'chat')}.`);
+  }
+  bArchive.onclick = () => batch('archive');
+  bDelete.onclick = () => batch('delete');
+
+  // ---------- keyboard shortcuts ----------
+  // Alt plus a letter, matched by key position so it also works where Alt types accented letters
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && sel.on && !sel.busy) { setSelect(false); return; }
+    if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    const act = { KeyQ: togglePanel, KeyS: startOrPause, KeyX: () => !sel.busy && setSelect(!sel.on), KeyL: () => openPanel('library') }[e.code];
+    if (!act) return;
+    e.preventDefault(); e.stopPropagation();
+    act();
+  }, true);
 
   GM_setValue('running', false);
   render();
+  setInterval(renderToday, 60000);
 })();
