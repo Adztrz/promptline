@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.2.1
+// @version      3.3
 // @description  Promptline (formerly ChatGPT Image Queue): queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -10,6 +10,7 @@
 // @grant        GM_setValue
 // @grant        GM_notification
 // @grant        GM_download
+// @grant        GM_addStyle
 // @connect      chatgpt.com
 // @connect      oaiusercontent.com
 // @connect      openai.com
@@ -74,6 +75,9 @@
     got: GM_getValue('got', []),  // queue positions whose images were already collected
     running: false,
     limitSeenAt: 0,               // turn count when the last limit message was handled
+    waitUntil: 0,                 // while waiting out a limit: when the queue resumes
+    runImages: 0,                 // images collected since Start, for the summary
+    failedSaves: 0,               // downloads that failed since Start
     note: '',
     bad: false,
   };
@@ -199,10 +203,13 @@
       setTimeout(() => URL.revokeObjectURL(href), 10000);
     } catch (_) {
       // the page can't read it (an image on another site): Tampermonkey fetches it instead
-      try { GM_download({ url, name: `${name}.png`, saveAs: false, onerror: () => setStatus(`Couldn't download ${name}.`, true) }); }
-      catch (__) { setStatus(`Couldn't download ${name}.`, true); }
+      try { GM_download({ url, name: `${name}.png`, saveAs: false, onerror: () => saveFailed(name) }); }
+      catch (__) { saveFailed(name); }
     }
   }
+
+  // a failed save is counted for the end-of-run summary, so the message isn't lost under the next status
+  function saveFailed(name) { state.failedSaves++; setStatus(`Couldn't save ${name}. The queue carries on; the summary will count it.`, true); }
 
   // After prompt i has finished, save the images in the last reply once.
   function collect(i) {
@@ -211,7 +218,9 @@
     const t = lastTurn();
     if (!t) return;
     countImages(t);
-    if (settings.download) bigImages(t).forEach((src, k) => download(src, fileName(i, k)));
+    const imgs = bigImages(t);
+    state.runImages += imgs.length;
+    if (settings.download) imgs.forEach((src, k) => download(src, fileName(i, k)));
   }
 
   // ---------- limits ----------
@@ -233,17 +242,19 @@
     return Math.min((ms || CFG.limitDefaultMs) + CFG.limitBufferMs, CFG.limitMaxMs);
   }
 
+  // the wait itself is drawn by the panel's limit banner and the launcher, ticking every second
   async function countdown(until) {
-    while (state.running && Date.now() < until) {
-      setStatus(`Limit hit. Resuming in ${plural(Math.ceil((until - Date.now()) / 60000), 'min')} (around ${clock(until)}). Keep this tab open.`);
-      await sleep(5000);
-    }
+    state.waitUntil = until; render();
+    setStatus('Waiting out ChatGPT\'s limit. Keep this tab open; the queue sends that prompt again by itself.');
+    while (state.running && Date.now() < until) { renderWait(); await sleep(1000); }
+    state.waitUntil = 0; render();
     return state.running;
   }
 
   // ---------- the queue ----------
   async function run() {
     state.limitSeenAt = turnCount();  // a limit message already on the page is old news
+    state.runImages = 0; state.failedSaves = 0;
     while (state.running) {
       const idle = await waitIdle();
       if (!state.running) return;
@@ -268,7 +279,7 @@
 
       const before = turnCount();
       const err = await sendPrompt(state.queue[state.idx]);
-      if (err) return pause(`${err} Press Check and tell Claude what it says.`);
+      if (err) return pause(`${err} Open More → Check page to see what the script can find.`);
       state.idx++; save(); render();
       updateDaily((d) => { d.sent++; });
       setStatus(`Sent ${state.idx} of ${state.queue.length}. Waiting for the reply…`);
@@ -276,8 +287,15 @@
     }
     if (!state.running) return;
     state.running = false; save(); render();
-    setStatus(`Done: ${plural(state.queue.length, 'prompt')} sent.`);
-    notify(`Done: ${plural(state.queue.length, 'prompt')} sent.`);
+    const summary = doneSummary();
+    setStatus(summary, state.failedSaves > 0);
+    notify(summary);
+  }
+
+  function doneSummary() {
+    const imgs = state.runImages ? ` · ${plural(state.runImages, 'image')}${settings.download ? ' saved' : ''}` : '';
+    const failed = state.failedSaves ? ` · ${state.failedSaves} couldn't be saved` : '';
+    return `Done: ${plural(state.queue.length, 'prompt')} sent${imgs}${failed}.`;
   }
 
   function pause(msg, bad = true) {
@@ -309,21 +327,62 @@
   // Built without innerHTML and styled in JS, so ChatGPT's page rules don't block it.
   const C = {
     canvas: '#07090b', card: '#090b0c', raised: '#1a1d1e', divider: '#262727', border: '#363738', rule: '#696a68',
-    strong: '#efefed', bone: '#e9e1dc', text: '#b3b0af', muted: '#8a8b8a', faint: '#565858', alert: '#f12614', positive: '#55bc82',
+    // faint is the quietest text that still reads: 4.6:1 on the card
+    strong: '#efefed', bone: '#e9e1dc', text: '#b3b0af', muted: '#8a8b8a', faint: '#7a7b7a', alert: '#f12614', positive: '#55bc82',
   };
   const SANS = '"Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif';
   const MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
   const EASE = 'cubic-bezier(0.4, 0, 0.2, 1)';
   const CARD_SHADOW = `inset 0 0 0 1px ${C.divider}, 0 1px 0 rgba(255,255,255,.02), 0 12px 32px rgba(0,0,0,.55)`;
+  const H = '32px';  // one control height for buttons and single-line fields
+
+  // What inline styles can't reach: placeholders, focus rings, scrollbars, selection, the narrow-window layout.
+  const CSS = `
+      .pl-root { color-scheme: dark; }
+      .pl-root ::placeholder { color: ${C.muted}; opacity: 1; }
+      .pl-root ::selection { background: rgba(233,225,220,.28); color: ${C.strong}; }
+      .pl-root * { scrollbar-width: thin; scrollbar-color: ${C.border} transparent; }
+      .pl-root :focus { outline: none; }
+      .pl-root :focus-visible { outline: 2px solid ${C.bone}; outline-offset: 2px; }
+      .pl-root input:focus-visible, .pl-root textarea:focus-visible { outline-offset: 0; border-color: ${C.rule} !important; }
+      @media (max-width: 520px) {
+        .pl-panel { left: 8px !important; right: 8px !important; width: auto !important; max-width: none !important; }
+        .pl-bar { top: 8px !important; }
+      }`;
+  try { GM_addStyle(CSS); } catch (_) {
+    try { const sheet = new CSSStyleSheet(); sheet.replaceSync(CSS); document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet]; }
+    catch (__) { /* everything still works, with default placeholders and focus rings */ }
+  }
 
   const el = (tag, style, text) => { const e = document.createElement(tag); Object.assign(e.style, style || {}); if (text) e.textContent = text; return e; };
-  const hover = (e, on, off) => { e.addEventListener('mouseenter', () => !e.disabled && Object.assign(e.style, on)); e.addEventListener('mouseleave', () => Object.assign(e.style, off)); };
+  const hover = (e, on, off) => { e.addEventListener('mouseenter', () => !e.disabled && Object.assign(e.style, on)); e.addEventListener('mouseleave', () => Object.assign(e.style, typeof off === 'function' ? off() : off)); };
   const dim = (...bs) => { for (const b of bs) { b.style.opacity = b.disabled ? '.4' : '1'; b.style.cursor = b.disabled ? 'default' : 'pointer'; } };
 
-  // buttons: 32px, 8px corners, hairline edge; the one primary action is bone
+  // small line icons, drawn node by node like the logo
+  const NS = 'http://www.w3.org/2000/svg';
+  function icon(d, px = 16, stroke = 'currentColor', width = 1.8) {
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('width', px); svg.setAttribute('height', px);
+    svg.setAttribute('aria-hidden', 'true');
+    Object.assign(svg.style, { display: 'block', flex: 'none' });
+    for (const part of [].concat(d)) {
+      const p = document.createElementNS(NS, 'path');
+      p.setAttribute('d', part); p.setAttribute('fill', 'none'); p.setAttribute('stroke', stroke);
+      p.setAttribute('stroke-width', width); p.setAttribute('stroke-linecap', 'round'); p.setAttribute('stroke-linejoin', 'round');
+      svg.append(p);
+    }
+    return svg;
+  }
+  const ICON = {
+    check: 'M5 12.5l4.2 4.2L19 7',
+    more: ['M5 12h.01', 'M12 12h.01', 'M19 12h.01'],
+    select: ['M4 6.5l1.8 1.8L9 5', 'M4 13.5l1.8 1.8L9 12', 'M12.5 7h7.5', 'M12.5 14h7.5', 'M4 19.5h16'],
+  };
+
+  // buttons: one height, 8px corners, hairline edge; the one primary action is bone
   function button(label, kind = 'plain') {
     const base = {
-      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', height: '30px', padding: '0 12px', boxSizing: 'border-box',
+      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '6px', height: H, padding: '0 12px', boxSizing: 'border-box',
       width: 'auto', minWidth: '0', margin: '0', flex: 'none', textTransform: 'none', letterSpacing: 'normal', // ignore the page's own button styles
       borderRadius: '8px', cursor: 'pointer', whiteSpace: 'nowrap', font: `500 13px/1 ${SANS}`, transition: `border-color .15s ${EASE}, background .15s ${EASE}, color .15s ${EASE}`,
     };
@@ -336,9 +395,16 @@
     const b = el('button', { ...base, ...look }, label);
     b.type = 'button';
     if (kind === 'primary') hover(b, { background: C.strong, borderColor: C.strong }, { background: C.bone, borderColor: C.bone });
-    else if (kind === 'ghost') hover(b, { color: C.strong, borderColor: C.border }, { color: b.active ? C.strong : C.muted, borderColor: 'transparent' });
+    else if (kind === 'ghost') hover(b, { color: C.strong, borderColor: C.border }, () => ({ color: b.active ? C.strong : C.muted, borderColor: 'transparent' }));
     else if (kind === 'danger') hover(b, { background: 'rgba(241,38,20,.1)' }, { background: 'transparent' });
     else hover(b, { borderColor: C.rule, background: 'rgba(255,255,255,.03)' }, { borderColor: C.border, background: 'transparent' });
+    return b;
+  }
+  function iconButton(d, label, stroke = 1.8) {
+    const b = button('', 'ghost');
+    Object.assign(b.style, { width: H, padding: '0' });
+    b.append(icon(d, 18, 'currentColor', stroke));
+    b.setAttribute('aria-label', label); b.title = label;
     return b;
   }
   // "tag with dot": uppercase label, wide tracking, a small dot, no box
@@ -351,29 +417,48 @@
   }
   const pulse = (e) => e.animate([{ opacity: 1 }, { opacity: .25 }, { opacity: 1 }], { duration: 1600, iterations: Infinity, easing: 'ease-in-out' });
   const fieldStyle = {
-    width: '100%', boxSizing: 'border-box', padding: '8px 12px', borderRadius: '8px', border: `1px solid ${C.border}`,
-    background: C.raised, color: C.strong, font: `400 12px/1.55 ${MONO}`, outline: 'none', transition: `border-color .15s ${EASE}`,
+    width: '100%', boxSizing: 'border-box', padding: '0 12px', height: H, borderRadius: '8px', border: `1px solid ${C.border}`,
+    background: C.raised, color: C.strong, font: `400 12px/1.55 ${MONO}`, transition: `border-color .15s ${EASE}`,
   };
-  function field(tagName, placeholder, style) {
-    const f = el(tagName, { ...fieldStyle, ...style });
+  function field(tagName, placeholder, label, style) {
+    const f = el(tagName, { ...fieldStyle, ...(tagName === 'textarea' ? { height: 'auto', padding: '10px 12px' } : {}), ...style });
     f.placeholder = placeholder;
-    f.addEventListener('focus', () => { f.style.borderColor = C.rule; });
-    f.addEventListener('blur', () => { f.style.borderColor = C.border; });
+    f.setAttribute('aria-label', label);
     // typing in our fields must not reach ChatGPT's own shortcuts
-    f.addEventListener('keydown', (e) => e.stopPropagation());
+    f.addEventListener('keydown', (e) => { if (e.key !== 'Escape') e.stopPropagation(); });
     return f;
   }
+  // a tick box drawn by hand: ChatGPT's page styles hide native checkboxes
+  function tickBox() {
+    const box = el('span', {
+      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none', width: '18px', height: '18px', boxSizing: 'border-box',
+      borderRadius: '5px', border: `1px solid ${C.rule}`, color: C.canvas, transition: `background .15s ${EASE}, border-color .15s ${EASE}`,
+    });
+    const mark = icon(ICON.check, 14, 'currentColor', 2.6);
+    box.append(mark);
+    box.set = (on) => {
+      mark.style.visibility = on ? 'visible' : 'hidden';
+      box.style.background = on ? C.bone : 'transparent';
+      box.style.borderColor = on ? C.bone : C.rule;
+    };
+    return box;
+  }
+  // a keyboard key, for the shortcut list
+  const kbd = (k) => el('kbd', {
+    display: 'inline-block', minWidth: '20px', padding: '3px 6px', borderRadius: '5px', boxSizing: 'border-box', textAlign: 'center',
+    background: C.raised, boxShadow: `inset 0 0 0 1px ${C.border}, 0 1px 0 ${C.border}`, font: `500 11px/1.2 ${MONO}`, color: C.strong,
+  }, k);
 
-  // the logo (same drawing as icon.svg): a stack of image cards with a play badge, built node by node
+  // the logo (same drawing as icon.svg): a stack of image cards with a play badge
   function logo(px) {
-    const NS = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(NS, 'svg');
     svg.setAttribute('viewBox', '0 0 128 128');
     svg.setAttribute('width', px); svg.setAttribute('height', px);
+    svg.setAttribute('aria-hidden', 'true');
     svg.style.display = 'block'; svg.style.flex = 'none';
     const add = (tagName, attrs) => { const e = document.createElementNS(NS, tagName); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); svg.append(e); return e; };
     add('rect', { width: 128, height: 128, rx: 28, fill: C.canvas });
-    add('rect', { x: 42, y: 18, width: 64, height: 50, rx: 10, fill: C.raised, stroke: C.faint, 'stroke-width': 3 });
+    add('rect', { x: 42, y: 18, width: 64, height: 50, rx: 10, fill: C.raised, stroke: '#565858', 'stroke-width': 3 });
     add('rect', { x: 31, y: 29, width: 66, height: 52, rx: 10, fill: C.raised, stroke: C.muted, 'stroke-width': 3 });
     add('rect', { x: 18, y: 42, width: 72, height: 58, rx: 11, fill: C.bone });
     add('circle', { cx: 68, cy: 58, r: 7, fill: C.canvas });
@@ -382,103 +467,152 @@
     add('path', { d: 'M90 85 L105 96 L90 107 Z', fill: C.canvas });
     return svg;
   }
+  // 1:05:09, 4:07, 0:42
+  const hms = (ms) => {
+    const s = Math.max(0, Math.ceil(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+    return h ? `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}` : `${m}:${String(r).padStart(2, '0')}`;
+  };
 
-  // the launcher: the logo, with the progress beside it once there is a queue
+  // the launcher: the logo, with the progress (or the limit countdown) beside it
   const toggle = button('', 'plain');
+  toggle.className = 'pl-root';
   Object.assign(toggle.style, { position: 'fixed', right: '16px', bottom: '96px', zIndex: 99999, gap: '8px', height: '36px', padding: '0 6px', background: C.card, boxShadow: '0 4px 16px rgba(0,0,0,.45)' });
   hover(toggle, { borderColor: C.rule, background: C.raised }, { borderColor: C.border, background: C.card });
   const toggleLogo = logo(24);
-  const toggleCount = el('span', { font: `500 12px/1 ${MONO}`, color: C.muted, marginRight: '4px' });
+  const toggleCount = el('span', { font: `500 12px/1 ${MONO}`, color: C.muted, marginRight: '4px', fontVariantNumeric: 'tabular-nums' });
   toggle.append(toggleLogo, toggleCount);
   toggle.title = 'Promptline (Alt+Q)';
+  toggle.setAttribute('aria-label', 'Promptline (Alt+Q)');
+  toggle.setAttribute('aria-controls', 'pl-panel');
   let badgePulse = null;
 
+  // The panel grows up from above the launcher, never taller than the window: header and tabs stay put, the body scrolls.
   const panel = el('div', {
-    position: 'fixed', right: '16px', bottom: '138px', zIndex: 99999, width: '412px', maxWidth: 'calc(100vw - 32px)', boxSizing: 'border-box',
-    padding: '20px', borderRadius: '8px', background: C.card, color: C.text, boxShadow: CARD_SHADOW, font: `400 13px/1.45 ${SANS}`, display: 'none',
+    position: 'fixed', right: '16px', bottom: '138px', zIndex: 99999, width: '412px', maxWidth: 'calc(100vw - 32px)', maxHeight: 'calc(100vh - 160px)',
+    boxSizing: 'border-box', padding: '18px 20px 20px', borderRadius: '8px', background: C.card, color: C.text, boxShadow: CARD_SHADOW,
+    font: `400 13px/1.45 ${SANS}`, display: 'none', flexDirection: 'column',
   });
+  panel.id = 'pl-panel';
+  panel.className = 'pl-root pl-panel';
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Promptline');
 
-  // header: tag on the left, count pill on the right
-  const header = el('div', { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' });
+  // header: name, then progress, then the chat-selection mode switch
+  const header = el('div', { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px', flex: 'none' });
   const headTag = tag('Promptline');
-  const pill = el('span', { minWidth: '20px', padding: '2px 8px', borderRadius: '9999px', background: 'rgba(255,255,255,.05)', font: `500 11px/1.4 ${MONO}`, color: C.muted, textAlign: 'center' });
-  header.append(headTag, pill);
+  const pill = el('span', { minWidth: '20px', padding: '2px 8px', borderRadius: '9999px', background: 'rgba(255,255,255,.05)', font: `500 11px/1.4 ${MONO}`, color: C.muted, textAlign: 'center', fontVariantNumeric: 'tabular-nums' });
+  const bSelect = iconButton(ICON.select, 'Select chats to archive or delete (Alt+X)');
+  header.append(headTag, el('span', { flex: '1' }), pill, bSelect);
 
   // today's numbers, under the header
-  const todayLine = el('div', { font: `500 11px/1.4 ${MONO}`, color: C.faint, marginBottom: '12px' });
+  const todayLine = el('div', { font: `500 12px/1.4 ${MONO}`, color: C.faint, marginBottom: '10px', flex: 'none' });
 
-  // tabs
-  const tabs = el('div', { display: 'flex', gap: '2px', alignItems: 'center', margin: '0 -8px 14px', borderBottom: `1px solid ${C.divider}`, paddingBottom: '8px' });
-  const tabBtns = { queue: button('Queue', 'ghost'), library: button('Library', 'ghost'), settings: button('Settings', 'ghost') };
-  const bSelect = button('Select chats', 'ghost');
-  bSelect.title = 'Pick chats in the sidebar to archive or delete (Alt+X)';
-  tabs.append(tabBtns.queue, tabBtns.library, tabBtns.settings, el('span', { flex: '1' }), bSelect);
+  // tabs, with the active one underlined as well as brighter
+  const tabs = el('div', { display: 'flex', gap: '2px', alignItems: 'center', margin: '0 -8px 14px', borderBottom: `1px solid ${C.divider}`, flex: 'none' });
+  tabs.setAttribute('role', 'tablist');
+  tabs.setAttribute('aria-label', 'Promptline sections');
+  const TABS = ['queue', 'library', 'settings'];
+  const tabBtns = {};
+  for (const k of TABS) {
+    const b = button(k[0].toUpperCase() + k.slice(1), 'ghost');
+    Object.assign(b.style, { borderRadius: '6px 6px 0 0', borderBottom: '2px solid transparent', marginBottom: '-1px', height: '34px' });
+    b.setAttribute('role', 'tab'); b.id = `pl-tab-${k}`; b.setAttribute('aria-controls', `pl-view-${k}`);
+    tabBtns[k] = b;
+    tabs.append(b);
+  }
   let tab = 'queue';
 
-  // edit view: paste prompts, see how many were found
-  const editView = el('div');
-  const area = field('textarea', 'Paste prompts, one per line.\n1. A single red rose…\n2. Three pastel eggs…', { height: '150px', resize: 'vertical', padding: '10px 12px' });
+  // the scrolling body that holds whichever view is open
+  const body = el('div', { flex: '1', minHeight: '0', display: 'flex', flexDirection: 'column' });
+
+  // limit banner: while the queue waits out a limit, this is the headline
+  const waitBox = el('div', { display: 'none', flex: 'none', padding: '12px 14px', marginBottom: '12px', borderRadius: '8px', background: C.raised, boxShadow: `inset 0 0 0 1px ${C.rule}` });
+  waitBox.setAttribute('role', 'timer');
+  const waitTag = tag('Waiting out a limit', C.bone, C.strong);
+  const waitClock = el('div', { font: `500 28px/1.1 ${MONO}`, color: C.strong, margin: '8px 0 4px', fontVariantNumeric: 'tabular-nums', letterSpacing: '-.02em' });
+  const waitNote = el('div', { fontSize: '12px', color: C.text });
+  waitBox.append(waitTag, waitClock, waitNote);
+
+  // queue: edit view (paste prompts) or queue view (cards)
+  const queueTab = el('div', { flex: '1', minHeight: '0', display: 'flex', flexDirection: 'column' });
+  queueTab.id = 'pl-view-queue'; queueTab.setAttribute('role', 'tabpanel'); queueTab.setAttribute('aria-labelledby', 'pl-tab-queue');
+  const editView = el('div', { display: 'flex', flexDirection: 'column', minHeight: '0', overflowY: 'auto' });
+  const undoStrip = el('div', { display: 'none', alignItems: 'center', gap: '8px', padding: '6px 6px 6px 12px', marginBottom: '10px', borderRadius: '8px', background: C.raised, fontSize: '12px', color: C.text });
+  const undoText = el('span', { flex: '1' });
+  const bUndo = button('Undo', 'plain');
+  undoStrip.append(undoText, bUndo);
+  const area = field('textarea', 'Paste prompts, one per line.\n1. A single red rose…\n2. Three pastel eggs…', 'Prompts, one per line', { height: '150px', resize: 'vertical', flex: 'none' });
   const found = el('div', { margin: '8px 0 14px', fontSize: '12px', color: C.muted });
   const editRow = el('div', { display: 'flex', gap: '8px', justifyContent: 'flex-end' });
   const bCancel = button('Cancel', 'ghost');
   const bLoad = button('Load prompts', 'primary');
   editRow.append(bCancel, bLoad);
-  editView.append(area, found, editRow);
+  editView.append(undoStrip, area, found, editRow);
 
-  // queue view: each prompt is its own card, spaced apart
-  const queueView = el('div');
-  const list = el('ol', { listStyle: 'none', margin: '0 -4px 0 0', padding: '0 4px 0 0', display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '42vh', overflowY: 'auto' });
-  const status = el('div', { margin: '14px 0', minHeight: '18px', fontSize: '12px', lineHeight: '1.4', color: C.muted });
-  const row = el('div', { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' });
-  const bStart = button('Start', 'primary');
-  bStart.title = 'Start (Alt+S)';
-  const bPause = button('Pause');
-  bPause.title = 'Pause (Alt+S)';
+  const queueView = el('div', { flex: '1', minHeight: '0', display: 'flex', flexDirection: 'column' });
+  const list = el('ol', { listStyle: 'none', margin: '0 -4px 0 0', padding: '0 4px 0 0', display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto', minHeight: '0', flex: '1' });
+  list.setAttribute('aria-label', 'Queued prompts');
+  const status = el('div', { margin: '12px 0', minHeight: '18px', fontSize: '12px', lineHeight: '1.45', color: C.muted, flex: 'none' });
+  status.setAttribute('aria-live', 'polite');
+  // one primary toggle (Start / Pause / Resume), Skip, and the rarely used rest behind More
+  const row = el('div', { display: 'flex', gap: '6px', alignItems: 'center', flex: 'none', position: 'relative' });
+  const bRun = button('Start', 'primary');
+  bRun.title = 'Start or pause (Alt+S)';
   const bSkip = button('Skip');
   bSkip.title = 'Skip the next prompt';
-  const bEdit = button('Edit', 'ghost');
-  const bCheck = button('Check', 'ghost');
-  bCheck.title = 'Show what the script can find on this page';
-  const bClear = button('Clear', 'ghost');
-  row.append(bStart, bPause, bSkip, el('span', { flex: '1' }), bEdit, bCheck, bClear);
+  const bMore = iconButton(ICON.more, 'More queue actions', 3.2);
+  bMore.setAttribute('aria-haspopup', 'menu'); bMore.setAttribute('aria-expanded', 'false');
+  const menu = el('div', {
+    display: 'none', position: 'absolute', right: '0', bottom: 'calc(100% + 6px)', zIndex: 1, minWidth: '190px', padding: '4px',
+    borderRadius: '8px', background: C.raised, boxShadow: `inset 0 0 0 1px ${C.border}, 0 8px 24px rgba(0,0,0,.5)`, flexDirection: 'column',
+  });
+  menu.setAttribute('role', 'menu');
+  const menuItem = (label, hint) => {
+    const b = button(label, 'ghost');
+    Object.assign(b.style, { justifyContent: 'flex-start', width: '100%', color: C.strong, height: '34px', padding: '0 10px' });
+    b.setAttribute('role', 'menuitem');
+    if (hint) b.title = hint;
+    menu.append(b);
+    return b;
+  };
+  const mEdit = menuItem('Edit queue', 'Change the prompts that haven\'t been sent');
+  const mCheck = menuItem('Check page', 'Show what the script can find on this page, for when ChatGPT changes');
+  const mClear = menuItem('Clear queue', 'Remove every prompt (you can undo)');
+  mClear.style.color = C.alert;
+  row.append(bRun, bSkip, el('span', { flex: '1' }), bMore, menu);
   queueView.append(list, status, row);
+  queueTab.append(waitBox, editView, queueView);
 
-  // library view: saved prompts to insert into the chat box or add to the queue
-  const libView = el('div');
-  const libTop = el('div', { display: 'flex', gap: '8px', marginBottom: '10px' });
-  const libSearch = field('input', 'Search saved prompts (Enter inserts the first)', { flex: '1' });
+  // library: saved prompts to insert into the chat box or add to the queue
+  const libView = el('div', { flex: '1', minHeight: '0', display: 'flex', flexDirection: 'column' });
+  libView.id = 'pl-view-library'; libView.setAttribute('role', 'tabpanel'); libView.setAttribute('aria-labelledby', 'pl-tab-library');
+  const libTop = el('div', { display: 'flex', gap: '8px', marginBottom: '10px', flex: 'none' });
+  const libSearch = field('input', 'Search saved prompts', 'Search saved prompts; Enter inserts the first match', { flex: '1' });
   const bNewSnip = button('New');
   libTop.append(libSearch, bNewSnip);
-  const libForm = el('div', { display: 'none', flexDirection: 'column', gap: '8px', padding: '12px', borderRadius: '8px', boxShadow: `inset 0 0 0 1px ${C.rule}`, marginBottom: '10px' });
-  const snipName = field('input', 'Name, e.g. Realistic landscape style');
-  const snipText = field('textarea', 'The prompt text. Several lines become several queue prompts.', { height: '90px', resize: 'vertical' });
+  const libForm = el('div', { display: 'none', flexDirection: 'column', gap: '8px', padding: '12px', borderRadius: '8px', boxShadow: `inset 0 0 0 1px ${C.rule}`, marginBottom: '10px', flex: 'none' });
+  const snipName = field('input', 'Name, e.g. Realistic landscape style', 'Name');
+  const snipText = field('textarea', 'The prompt text. Several lines become several queue prompts.', 'Prompt text', { height: '90px', resize: 'vertical' });
   const libFormRow = el('div', { display: 'flex', gap: '8px', justifyContent: 'flex-end' });
   const bSnipCancel = button('Cancel', 'ghost');
   const bSnipSave = button('Save', 'primary');
   libFormRow.append(bSnipCancel, bSnipSave);
   libForm.append(snipName, snipText, libFormRow);
-  const libList = el('ol', { listStyle: 'none', margin: '0 -4px 0 0', padding: '0 4px 0 0', display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '42vh', overflowY: 'auto' });
-  const libNote = el('div', { marginTop: '10px', minHeight: '18px', fontSize: '12px', color: C.muted });
+  const libList = el('ol', { listStyle: 'none', margin: '0 -4px 0 0', padding: '0 4px 0 0', display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto', minHeight: '0', flex: '1' });
+  const libNote = el('div', { marginTop: '10px', minHeight: '18px', fontSize: '12px', color: C.muted, flex: 'none' });
+  libNote.setAttribute('aria-live', 'polite');
   libView.append(libTop, libForm, libList, libNote);
   let snipEditing = -1;
 
-  // settings view
-  const setView = el('div', { display: 'flex', flexDirection: 'column', gap: '12px' });
-  // drawn by hand: ChatGPT's page styles hide native checkboxes
+  // settings
+  const setView = el('div', { flex: '1', minHeight: '0', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '14px', paddingRight: '4px' });
+  setView.id = 'pl-view-settings'; setView.setAttribute('role', 'tabpanel'); setView.setAttribute('aria-labelledby', 'pl-tab-settings');
   function checkRow(key, label, hint) {
-    const r = el('div', { display: 'grid', gridTemplateColumns: '18px 1fr', gap: '2px 10px', cursor: 'pointer', alignItems: 'start' });
-    r.setAttribute('role', 'checkbox'); r.tabIndex = 0;
-    const box = el('span', {
-      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '16px', height: '16px', marginTop: '2px', boxSizing: 'border-box',
-      borderRadius: '4px', font: `700 11px/1 ${SANS}`, color: C.canvas, transition: `background .15s ${EASE}, border-color .15s ${EASE}`,
-    });
-    const paint = () => {
-      const on = settings[key];
-      box.textContent = on ? '✓' : '';
-      box.style.background = on ? C.bone : 'transparent';
-      box.style.border = `1px solid ${on ? C.bone : C.rule}`;
-      r.setAttribute('aria-checked', String(on));
-    };
+    const r = el('div', { display: 'grid', gridTemplateColumns: '18px 1fr', gap: '3px 12px', cursor: 'pointer', alignItems: 'start', borderRadius: '6px' });
+    r.setAttribute('role', 'checkbox'); r.tabIndex = 0; r.setAttribute('aria-label', label);
+    const box = tickBox();
+    box.style.marginTop = '1px';
+    const paint = () => { box.set(settings[key]); r.setAttribute('aria-checked', String(settings[key])); };
     const flip = () => { settings[key] = !settings[key]; saveSettings(); paint(); render(); };
     r.onclick = flip;
     r.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); flip(); } });
@@ -486,49 +620,69 @@
     r.append(box, el('span', { color: C.strong }, label), el('span'), el('span', { fontSize: '12px', color: C.muted }, hint));
     return r;
   }
-  const prefixLabel = el('div', { color: C.strong }, 'File name prefix');
-  const prefixInput = field('input', 'e.g. cozy-  →  cozy-001-a-small-wooden-cabin.png');
+  const prefixGroup = el('div', { display: 'flex', flexDirection: 'column', gap: '6px' });
+  const prefixInput = field('input', 'e.g. cozy-', 'File name prefix');
+  prefixInput.id = 'pl-prefix';
+  const prefixLabel = el('label', { color: C.strong }, 'File name prefix');
+  prefixLabel.htmlFor = 'pl-prefix';
+  const prefixHint = el('div', { fontSize: '12px', color: C.muted });
+  const paintPrefix = () => { prefixHint.textContent = `Files are named like ${settings.prefix.replace(/[\\/:*?"<>|]+/g, '-')}001-a-small-wooden-cabin.${settings.png ? 'png' : 'webp'}`; };
   prefixInput.value = settings.prefix;
-  prefixInput.oninput = () => { settings.prefix = prefixInput.value; saveSettings(); };
-  const bTestNote = button('Test notification');
+  prefixInput.oninput = () => { settings.prefix = prefixInput.value; saveSettings(); paintPrefix(); };
+  prefixGroup.append(prefixLabel, prefixInput, prefixHint);
+  const bTestNote = button('Send a test notification');
   bTestNote.onclick = () => { const was = settings.notify; settings.notify = true; notify('Notifications work.'); settings.notify = was; };
-  const keys = el('div', { font: `400 12px/1.7 ${MONO}`, color: C.muted, whiteSpace: 'pre' },
-    'Alt+Q  open or close this panel\nAlt+S  start or pause the queue\nAlt+X  select chats in the sidebar\nAlt+L  prompt library\nEsc    leave chat selection');
   const testRow = el('div', { display: 'flex' });
   testRow.append(bTestNote);
+  const keysHead = el('div', { color: C.strong, marginTop: '4px' }, 'Keyboard shortcuts');
+  const keys = el('div', { display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '8px 12px', alignItems: 'center', fontSize: '12px', color: C.text });
+  for (const [k, what] of [[['Alt', 'Q'], 'Open or close this panel'], [['Alt', 'S'], 'Start or pause the queue'], [['Alt', 'X'], 'Select chats in the sidebar'], [['Alt', 'L'], 'Prompt library'], [['Esc'], 'Close a menu, leave selection, or close the panel']]) {
+    const combo = el('span', { display: 'inline-flex', gap: '4px', alignItems: 'center' });
+    k.forEach((x, i) => { if (i) combo.append(el('span', { color: C.faint, fontSize: '11px' }, '+')); combo.append(kbd(x)); });
+    keys.append(combo, el('span', {}, what));
+  }
   setView.append(
     checkRow('download', 'Download images automatically', 'Each image is saved as soon as its prompt finishes, named by queue number and prompt.'),
     checkRow('png', 'Save as PNG', 'ChatGPT makes WebP images. On: each is converted to PNG, same pixels in a bigger file. Off: the original WebP is kept.'),
-    prefixLabel, prefixInput,
+    prefixGroup,
     checkRow('autoResume', 'Wait out limits and resume', 'When ChatGPT says you hit a limit, wait until it resets, then send that prompt again.'),
     checkRow('notify', 'Desktop notifications', 'When the queue finishes, pauses, or waits on a limit.'),
-    testRow, keys,
+    testRow, keysHead, keys,
   );
 
-  panel.append(header, todayLine, tabs, editView, queueView, libView, setView);
+  body.append(queueTab, libView, setView);
+  panel.append(header, todayLine, tabs, body);
 
-  // chat selection bar, along the top of the page
+  // chat selection bar, centred along the top of the page, wrapping by group rather than by button
   const bar = el('div', {
-    position: 'fixed', top: '12px', left: '50%', transform: 'translateX(-50%)', zIndex: 100000, display: 'none', alignItems: 'center', gap: '6px',
-    flexWrap: 'wrap', maxWidth: 'calc(100vw - 32px)', boxSizing: 'border-box', padding: '10px 12px', borderRadius: '8px',
-    background: C.card, color: C.text, boxShadow: CARD_SHADOW, font: `400 13px/1.45 ${SANS}`,
+    position: 'fixed', top: '12px', left: '0', right: '0', margin: '0 auto', width: 'max-content', maxWidth: 'calc(100vw - 32px)',
+    zIndex: 100000, display: 'none', alignItems: 'center', columnGap: '14px', rowGap: '8px', flexWrap: 'wrap', boxSizing: 'border-box',
+    padding: '8px 10px 8px 14px', borderRadius: '10px', background: C.card, color: C.text, boxShadow: CARD_SHADOW, font: `400 13px/1.45 ${SANS}`,
   });
+  bar.className = 'pl-root pl-bar';
+  bar.setAttribute('role', 'toolbar');
+  bar.setAttribute('aria-label', 'Select chats');
+  const group = (...kids) => { const g = el('div', { display: 'flex', alignItems: 'center', gap: '4px' }); g.append(...kids); return g; };
   const barTag = tag('Select chats', C.bone, C.strong);
-  const barCount = el('span', { font: `500 12px/1 ${MONO}`, color: C.muted, margin: '0 6px' });
-  const barFilter = field('input', 'Title contains…', { width: '150px', padding: '6px 10px' });
+  const barCount = el('span', { font: `500 12px/1 ${MONO}`, color: C.muted, marginLeft: '8px', fontVariantNumeric: 'tabular-nums' });
+  const barFilter = field('input', 'Title contains…', 'Select chats whose title contains', { width: '160px' });
   const bMatch = button('Select matching', 'ghost');
   const bAll = button('All', 'ghost');
   const bNone = button('None', 'ghost');
   const bArchive = button('Archive');
-  const bDelete = button('Delete', 'danger');
+  const bDelete = button('Delete…', 'danger');
+  const bStopBatch = button('Stop');
+  bStopBatch.style.display = 'none';
   const bDone = button('Done', 'primary');
   const barNote = el('span', { fontSize: '12px', color: C.muted, flexBasis: '100%', display: 'none' });
-  bar.append(barTag, barCount, barFilter, bMatch, bAll, bNone, bArchive, bDelete, bDone, barNote);
+  barNote.setAttribute('aria-live', 'polite');
+  bar.append(group(barTag, barCount), group(barFilter, bMatch), group(bAll, bNone), group(bArchive, bDelete, bStopBatch), group(bDone), barNote);
 
   document.body.append(toggle, panel, bar);
 
   let editing = !state.queue.length;
   let pulseAnim = null;
+  let shownIdx = -1;  // the card last scrolled into view, so a re-render doesn't yank the list
 
   function setStatus(t, bad = false) { state.note = t; state.bad = bad; status.textContent = t; status.style.color = bad ? C.alert : C.muted; }
 
@@ -537,67 +691,104 @@
     const reset = d.resetAt > Date.now() ? `  ·  limit resets ~${clock(d.resetAt)}` : '';
     todayLine.textContent = `Today  ${plural(d.sent, 'prompt')} sent  ·  ${plural(d.images, 'image')}${reset}`;
   }
+  function renderWait() {
+    const left = state.waitUntil - Date.now();
+    waitBox.style.display = state.waitUntil && state.running ? 'block' : 'none';
+    if (!state.waitUntil) return;
+    waitClock.textContent = hms(left);
+    waitNote.textContent = `Prompt ${state.idx + 1} goes again around ${clock(state.waitUntil)}. Keep this tab open; Pause stops the wait.`;
+    toggleCount.textContent = hms(left);
+  }
 
+  // The card being generated is the loudest; the next one is quiet but numbered brightly.
   function card(text, i) {
-    const sent = i < state.idx, next = i === state.idx, working = state.running && i === state.idx - 1;
+    const sent = i < state.idx, next = i === state.idx, working = state.running && !state.waitUntil && i === state.idx - 1;
     const li = el('li', {
       display: 'grid', gridTemplateColumns: '28px 1fr', gap: '4px 10px', padding: '12px 14px', borderRadius: '8px',
-      background: next ? C.raised : C.card, boxShadow: `inset 0 0 0 1px ${next ? C.rule : C.divider}`,
-      opacity: sent && !working ? '.55' : '1', transition: `opacity .2s ${EASE}, box-shadow .2s ${EASE}`,
+      background: working ? C.raised : C.card, boxShadow: `inset 0 0 0 1px ${working ? C.bone : C.divider}`,
+      opacity: sent && !working ? '.6' : '1', transition: `opacity .2s ${EASE}, box-shadow .2s ${EASE}`,
     });
-    const num = el('span', { gridRow: 'span 2', font: `500 12px/18px ${MONO}`, color: next ? C.strong : C.faint }, String(i + 1).padStart(2, '0'));
+    const num = el('span', { gridRow: 'span 2', font: `500 12px/18px ${MONO}`, color: working || next ? C.strong : C.faint, fontVariantNumeric: 'tabular-nums' }, String(i + 1).padStart(2, '0'));
     const label = working ? tag('Generating', C.bone, C.strong)
       : sent ? tag(state.got.includes(i) && settings.download ? 'Saved' : 'Sent', C.positive)
-      : next ? tag(state.running ? 'Up next' : 'Next', C.bone, C.strong)
+      : next ? tag('Next', C.bone, C.text)
       : tag('Queued', C.faint, C.faint);
     if (working) pulseAnim = pulse(label.dot);
     li.append(num, label, clampText(text, sent ? C.muted : C.text, 3));
     return li;
   }
+  // long text folds to a few lines; it opens by click or by keyboard
   function clampText(text, color, lines) {
     const p = el('p', {
-      margin: '0', color, fontSize: '13px', lineHeight: '1.5', overflowWrap: 'anywhere',
+      margin: '0', color, fontSize: '13px', lineHeight: '1.5', overflowWrap: 'anywhere', whiteSpace: 'pre-line', borderRadius: '4px',
       display: '-webkit-box', WebkitLineClamp: String(lines), WebkitBoxOrient: 'vertical', overflow: 'hidden', cursor: 'pointer',
     }, text);
-    p.title = 'Click to show or hide the whole text';
-    p.onclick = () => { p.style.webkitLineClamp = p.style.webkitLineClamp === 'unset' ? String(lines) : 'unset'; };
+    p.tabIndex = 0;
+    p.setAttribute('role', 'button');
+    p.setAttribute('aria-expanded', 'false');
+    p.title = 'Show or hide the whole text';
+    const flip = () => {
+      const open = p.style.webkitLineClamp !== 'unset';
+      p.style.webkitLineClamp = open ? 'unset' : String(lines);
+      p.setAttribute('aria-expanded', String(open));
+    };
+    p.onclick = flip;
+    p.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); flip(); } });
     return p;
   }
 
   function render() {
     const n = state.queue.length;
-    pill.textContent = n ? `${state.idx} / ${n}` : '0';
-    toggleCount.textContent = n ? `${state.idx}/${n}` : '';
+    const progress = n ? `${state.idx}/${n}` : '';
+    pill.textContent = progress;
+    pill.style.display = n ? 'inline-block' : 'none';
+    toggleCount.textContent = progress;
     toggleCount.style.display = n ? 'inline' : 'none';
+    toggle.setAttribute('aria-expanded', String(panel.style.display !== 'none'));
     // the play badge breathes while the queue runs
     if (state.running && !badgePulse) badgePulse = pulse(toggleLogo.badge);
     if (!state.running && badgePulse) { badgePulse.cancel(); badgePulse = null; }
 
-    for (const [k, b] of Object.entries(tabBtns)) { b.active = k === tab; b.style.color = b.active ? C.strong : C.muted; }
+    for (const k of TABS) {
+      const b = tabBtns[k], on = k === tab;
+      b.active = on;
+      b.style.color = on ? C.strong : C.muted;
+      b.style.borderBottomColor = on ? C.bone : 'transparent';
+      b.setAttribute('aria-selected', String(on));
+      b.tabIndex = on ? 0 : -1;
+    }
     bSelect.style.color = sel.on ? C.strong : C.muted;
-    editView.style.display = tab === 'queue' && editing ? 'block' : 'none';
-    queueView.style.display = tab === 'queue' && !editing ? 'block' : 'none';
-    libView.style.display = tab === 'library' ? 'block' : 'none';
+    bSelect.setAttribute('aria-pressed', String(sel.on));
+    queueTab.style.display = tab === 'queue' ? 'flex' : 'none';
+    editView.style.display = editing ? 'flex' : 'none';
+    queueView.style.display = editing ? 'none' : 'flex';
+    libView.style.display = tab === 'library' ? 'flex' : 'none';
     setView.style.display = tab === 'settings' ? 'flex' : 'none';
 
     bCancel.style.display = n ? 'inline-flex' : 'none';
     const cnt = parse(area.value).length;
-    found.textContent = cnt ? `${plural(cnt, 'prompt')} found` : 'One prompt per line. Numbers like "1." are removed.';
+    found.textContent = cnt ? `${plural(cnt, 'prompt')} found${n && state.idx < n ? ` · loading replaces the ${n - state.idx} not sent yet` : ''}` : 'One prompt per line. Numbers like "1." are removed.';
     bLoad.disabled = !cnt;
 
     if (pulseAnim) { pulseAnim.cancel(); pulseAnim = null; }
     list.replaceChildren(...state.queue.map(card));
-    const cur = list.children[Math.min(state.idx, n - 1)];
-    if (cur && panel.style.display !== 'none' && tab === 'queue') cur.scrollIntoView({ block: 'nearest' });
+    // bring the current card into view only when the position moves
+    const focusIdx = Math.min(Math.max(state.idx - (state.running ? 1 : 0), 0), n - 1);
+    if (focusIdx !== shownIdx && panel.style.display !== 'none' && tab === 'queue' && list.children[focusIdx]) {
+      list.children[focusIdx].scrollIntoView({ block: 'nearest' });
+      shownIdx = focusIdx;
+    }
 
-    bStart.textContent = state.running ? 'Running' : state.idx > 0 && state.idx < n ? 'Resume' : 'Start';
-    bStart.disabled = state.running || state.idx >= n;
-    bPause.disabled = !state.running;
-    bSkip.disabled = state.running || state.idx >= n;
-    bEdit.disabled = bClear.disabled = state.running;
-    dim(bLoad, bStart, bPause, bSkip, bEdit, bClear);
-    setStatus(state.note || (n && state.idx >= n ? `Done: ${plural(n, 'prompt')} sent.` : n ? 'Ready. Leave the chat box alone while it runs.' : ''), state.bad);
+    const done = state.idx >= n;
+    bRun.textContent = state.running ? 'Pause' : state.idx > 0 && !done ? 'Resume' : 'Start';
+    bRun.disabled = !state.running && (done || !n);
+    bSkip.disabled = state.running || done;
+    mEdit.disabled = mClear.disabled = state.running || !n;
+    dim(bLoad, bRun, bSkip, mEdit, mClear);
+    setStatus(state.note || (n && done ? `Done: ${plural(n, 'prompt')} sent.` : n ? 'Ready. Leave the chat box alone while it runs.' : ''), state.bad);
+    renderWait();
     renderToday();
+    paintPrefix();
     if (tab === 'library') renderLibrary();
   }
 
@@ -606,18 +797,24 @@
     const shown = library.map((s, i) => [s, i]).filter(([s]) => !q || `${s.name} ${s.text}`.toLowerCase().includes(q));
     libList.replaceChildren(...shown.map(([s, i]) => {
       const li = el('li', { display: 'flex', flexDirection: 'column', gap: '6px', padding: '12px 14px', borderRadius: '8px', boxShadow: `inset 0 0 0 1px ${C.divider}` });
+      const lines = parse(s.text).length;
+      const head = el('div', { display: 'flex', alignItems: 'baseline', gap: '8px' });
+      head.append(el('span', { color: C.strong, fontWeight: '500', flex: '1', overflowWrap: 'anywhere' }, s.name));
+      if (lines > 1) head.append(el('span', { font: `500 11px/1 ${MONO}`, color: C.faint }, `${lines} prompts`));
       const acts = el('div', { display: 'flex', gap: '4px', flexWrap: 'wrap', margin: '2px -8px -4px' });
-      const bIns = button('Insert', 'ghost'), bQ = button('Add to queue', 'ghost'), bEd = button('Edit', 'ghost'), bDel = button('Delete', 'ghost');
+      const bIns = button('Insert', 'ghost'), bQ = button('Add to queue', 'ghost'), bEd = button('Edit', 'ghost'), bDel = button('Delete…', 'ghost');
       bIns.title = 'Put it in the chat box';
       bIns.onclick = () => insertIntoChat(s.text);
       bQ.onclick = () => addToQueue(s.text);
       bEd.onclick = () => openSnipForm(i);
-      bDel.onclick = () => { if (confirm(`Delete "${s.name}" from the library?`)) { library.splice(i, 1); saveLibrary(); renderLibrary(); } };
+      bDel.onclick = () => { if (confirm(`Delete "${s.name}" from the library? This can't be undone.`)) { library.splice(i, 1); saveLibrary(); renderLibrary(); } };
       acts.append(bIns, bQ, el('span', { flex: '1' }), bEd, bDel);
-      li.append(el('div', { color: C.strong, fontWeight: '500' }, s.name), clampText(s.text, C.text, 2), acts);
+      li.append(head, clampText(s.text, C.text, 2), acts);
       return li;
     }));
-    if (!library.length) libNote.textContent = 'No saved prompts yet. Press New to add your favourite style lines and prompts.';
+    const formOpen = libForm.style.display !== 'none';
+    if (formOpen && !libNote.dataset.keep) libNote.textContent = '';
+    else if (!library.length) libNote.textContent = 'No saved prompts yet. Press New to save a style line or a set of prompts you reuse.';
     else if (!shown.length) libNote.textContent = 'Nothing matches that search.';
     else if (!libNote.dataset.keep) libNote.textContent = '';
   }
@@ -627,6 +824,7 @@
     snipName.value = i >= 0 ? library[i].name : '';
     snipText.value = i >= 0 ? library[i].text : '';
     libForm.style.display = 'flex';
+    renderLibrary();
     snipName.focus();
   }
   async function insertIntoChat(text) {
@@ -639,49 +837,91 @@
   }
   function addToQueue(text) {
     const l = parse(text);
-    if (!state.queue.length || state.idx >= state.queue.length) { state.queue = []; state.idx = 0; state.got = []; state.note = ''; }
+    const fresh = !state.queue.length || state.idx >= state.queue.length;
+    if (fresh) { state.queue = []; state.idx = 0; state.got = []; state.note = ''; }
     state.queue.push(...l); save();
     editing = false;
-    libSay(`Added ${plural(l.length, 'prompt')} to the queue.`);
+    libSay(fresh ? `Started a new queue with ${plural(l.length, 'prompt')}.` : `Added ${plural(l.length, 'prompt')} to the end of the queue (now ${state.queue.length}).`);
     render();
   }
 
+  // ---------- panel open, close, tabs, menu ----------
   function openPanel(which) {
     if (which) tab = which;
-    panel.style.display = 'block';
+    if (sel.on && !sel.busy) setSelect(false);  // one thing at a time: the panel or chat selection
+    panel.style.display = 'flex';
+    shownIdx = -1;
     render();
     if (tab === 'library') libSearch.focus();
   }
-  function togglePanel() { if (panel.style.display === 'none') openPanel(); else panel.style.display = 'none'; }
-  function startOrPause() { if (state.running) bPause.onclick(); else bStart.onclick(); }
+  function closePanel() { closeMenu(); panel.style.display = 'none'; render(); }
+  function togglePanel() { if (panel.style.display === 'none') openPanel(); else closePanel(); }
+  function startOrPause() { bRun.onclick(); }
+  function openMenu() { menu.style.display = 'flex'; bMore.setAttribute('aria-expanded', 'true'); const f = [...menu.children].find((b) => !b.disabled); if (f) f.focus(); }
+  function closeMenu() { if (menu.style.display === 'none') return; menu.style.display = 'none'; bMore.setAttribute('aria-expanded', 'false'); }
 
   toggle.onclick = togglePanel;
-  for (const [k, b] of Object.entries(tabBtns)) b.onclick = () => openPanel(k);
+  for (const k of TABS) tabBtns[k].onclick = () => openPanel(k);
+  // arrow keys move between tabs, as tab lists do
+  tabs.addEventListener('keydown', (e) => {
+    const d = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+    if (!d) return;
+    e.preventDefault(); e.stopPropagation();
+    const next = TABS[(TABS.indexOf(tab) + d + TABS.length) % TABS.length];
+    openPanel(next); tabBtns[next].focus();
+  });
+  bMore.onclick = (e) => { e.stopPropagation(); if (menu.style.display === 'none') openMenu(); else closeMenu(); };
+  menu.addEventListener('keydown', (e) => {
+    const items = [...menu.children].filter((b) => !b.disabled);
+    const d = { ArrowDown: 1, ArrowUp: -1 }[e.key];
+    if (d) { e.preventDefault(); e.stopPropagation(); items[(items.indexOf(document.activeElement) + d + items.length) % items.length].focus(); }
+  });
+  document.addEventListener('click', (e) => { if (!menu.contains(e.target) && !bMore.contains(e.target)) closeMenu(); }, true);
+
   area.addEventListener('input', render);
   bLoad.onclick = () => {
     const l = parse(area.value);
     if (!l.length) return;
     state.queue = l; state.idx = 0; state.got = []; state.note = ''; save();
-    editing = false; render();
+    editing = false; undoStrip.style.display = 'none'; render();
     setStatus(`Loaded ${plural(l.length, 'prompt')}. Press Start.`);
   };
   bCancel.onclick = () => { editing = false; render(); };
-  bEdit.onclick = () => { if (state.running) return; area.value = state.queue.slice(state.idx).join('\n'); editing = true; render(); area.focus(); };
-  bStart.onclick = () => {
-    if (state.running || state.idx >= state.queue.length) return;
+  mEdit.onclick = () => { closeMenu(); if (state.running) return; area.value = state.queue.slice(state.idx).join('\n'); editing = true; render(); area.focus(); };
+  bRun.onclick = () => {
+    if (state.running) return pause('Paused. Press Resume to continue from the next prompt.', false);
+    if (state.idx >= state.queue.length) return;
     state.running = true; save(); render();
     setStatus('Starting…');
     run().catch((e) => pause(`Stopped: ${e && e.message ? e.message : e}`));
   };
-  bPause.onclick = () => pause('Paused. Press Resume to continue from the next prompt.', false);
   bSkip.onclick = () => { if (!state.running && state.idx < state.queue.length) { state.idx++; save(); state.note = ''; render(); } };
-  bClear.onclick = () => { if (state.running) return; state.queue = []; state.idx = 0; state.got = []; state.note = ''; save(); area.value = ''; editing = true; render(); };
+  // Clear can be undone for a little while: an unfinished batch is too easy to lose to one click
+  let cleared = null, undoTimer = 0;
+  mClear.onclick = () => {
+    closeMenu();
+    if (state.running || !state.queue.length) return;
+    cleared = { queue: state.queue, idx: state.idx, got: state.got };
+    state.queue = []; state.idx = 0; state.got = []; state.note = ''; save(); area.value = ''; editing = true;
+    undoText.textContent = `Cleared ${plural(cleared.queue.length, 'prompt')}.`;
+    undoStrip.style.display = 'flex';
+    clearTimeout(undoTimer);
+    undoTimer = setTimeout(() => { undoStrip.style.display = 'none'; cleared = null; }, 10000);
+    render(); bUndo.focus();
+  };
+  bUndo.onclick = () => {
+    if (!cleared) return;
+    Object.assign(state, cleared); save();
+    cleared = null; undoStrip.style.display = 'none'; editing = false; state.note = '';
+    render(); bRun.focus();
+  };
   // Reports what the script can see, so a broken selector is easy to spot.
-  bCheck.onclick = () => {
+  mCheck.onclick = () => {
+    closeMenu();
     const box = findInput(), send = findSend();
     const all = [...document.querySelectorAll('[contenteditable="true"], textarea')].filter((e) => !ours(e));
     const desc = (e) => e ? `${e.tagName.toLowerCase()}${e.id ? '#' + e.id : ''}${e.isContentEditable ? ' (editable)' : ''}` : 'none';
-    setStatus(`Chat box: ${desc(box)}. Send button: ${send ? (send.getAttribute('data-testid') || send.getAttribute('aria-label') || 'found') + (send.disabled ? ' (disabled)' : '') : 'none'}. Editors on page: ${all.map(desc).join(', ') || 'none'}. Sidebar chats: ${chatLinks().length}. Busy: ${busy() ? 'yes' : 'no'}.`);
+    setStatus(`Chat box: ${desc(box)}. Send button: ${send ? (send.getAttribute('data-testid') || send.getAttribute('aria-label') || 'found') + (send.disabled ? ' (disabled)' : '') : 'none'}. Editors on page: ${all.map(desc).join(', ') || 'none'}. Replies on page: ${turnCount()}. Sidebar chats: ${chatLinks().length}. Busy: ${busy() ? 'yes' : 'no'}.`);
   };
 
   libSearch.addEventListener('input', renderLibrary);
@@ -692,36 +932,36 @@
     if (hit) insertIntoChat(hit.text);
   });
   bNewSnip.onclick = () => openSnipForm(-1);
-  bSnipCancel.onclick = () => { libForm.style.display = 'none'; };
+  bSnipCancel.onclick = () => { libForm.style.display = 'none'; renderLibrary(); };
   bSnipSave.onclick = () => {
     const name = snipName.value.trim(), text = snipText.value.trim();
     if (!text) return snipText.focus();
-    const s = { name: name || text.slice(0, 40), text };
+    const s = { name: name || text.split('\n')[0].slice(0, 40), text };
     if (snipEditing >= 0) library[snipEditing] = s; else library.unshift(s);
-    saveLibrary(); libForm.style.display = 'none'; renderLibrary();
+    saveLibrary(); libForm.style.display = 'none';
+    libSay(snipEditing >= 0 ? `Saved changes to "${s.name}".` : `Saved "${s.name}".`);
+    renderLibrary();
   };
 
   // ---------- chat selection: tick chats in the sidebar, then archive or delete them together ----------
-  const sel = { on: false, ids: new Set(), last: null, busy: false };
+  const sel = { on: false, ids: new Set(), last: null, busy: false, stop: false };
   const chatId = (a) => ((a.getAttribute('href') || '').match(/\/c\/([\w-]+)/) || [])[1];
   const chatLinks = () => [...document.querySelectorAll(SEL.chat)].filter((a) => chatId(a) && visible(a) && !ours(a));
+  const chatTitle = (id) => { const a = chatLinks().find((x) => chatId(x) === id); return a ? (a.getAttribute('aria-label') || a.innerText).trim() : 'a chat not loaded in the sidebar'; };
 
   function paintLink(a) {
     const on = sel.on && sel.ids.has(chatId(a));
     let box = a.querySelector(':scope > [data-iq-box]');
     if (sel.on && !box) {
-      box = el('span', {
-        display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none', width: '16px', height: '16px', marginRight: '8px',
-        borderRadius: '4px', border: `1px solid ${C.rule}`, font: `700 11px/1 ${SANS}`, color: C.canvas, boxSizing: 'border-box',
-      });
+      box = tickBox();
+      box.style.marginRight = '8px';
       box.dataset.iqBox = '1';
+      box.setAttribute('role', 'checkbox');
       a.prepend(box);
     }
     if (!sel.on) { if (box) box.remove(); a.style.boxShadow = ''; a.style.background = ''; return; }
-    const mark = on ? '✓' : '';
-    if (box.textContent !== mark) box.textContent = mark;  // only when it changes, or the observer loops
-    box.style.background = on ? C.bone : 'transparent';
-    box.style.borderColor = on ? C.bone : C.rule;
+    // only touch what changed, or the sidebar watcher wakes itself forever
+    if (box.getAttribute('aria-checked') !== String(on)) { box.set(on); box.setAttribute('aria-checked', String(on)); }
     a.style.boxShadow = on ? `inset 0 0 0 1px ${C.bone}` : '';
     a.style.background = on ? 'rgba(233,225,220,.08)' : '';
   }
@@ -740,19 +980,24 @@
     sel.on = on;
     say('');
     if (!on) { sel.ids.clear(); sel.last = null; watcher.disconnect(); }
-    else watcher.observe(document.body, { childList: true, subtree: true });
+    else { watcher.observe(document.body, { childList: true, subtree: true }); if (panel.style.display !== 'none') closePanel(); }
     bar.style.display = on ? 'flex' : 'none';
     document.querySelectorAll(SEL.chat).forEach(paintLink);
     renderBar(); render();
-    if (on && !chatLinks().length) say('No chats found in the sidebar. Open the sidebar first.');
+    if (on) {
+      if (!chatLinks().length) say('No chats found in the sidebar. Open the sidebar first.');
+      else say('Click chats in the sidebar to tick them. Shift+click ticks a range.');
+    }
   }
-  function say(t) { barNote.textContent = t; barNote.style.display = t ? 'block' : 'none'; }
+  function say(t, bad = false) { barNote.textContent = t; barNote.style.display = t ? 'block' : 'none'; barNote.style.color = bad ? C.alert : C.muted; }
   function renderBar() {
     if (!sel.on) return;
     const count = `${sel.ids.size} selected · ${chatLinks().length} loaded`;
     if (barCount.textContent !== count) barCount.textContent = count;
     bArchive.disabled = bDelete.disabled = !sel.ids.size || sel.busy;
     bAll.disabled = bNone.disabled = bMatch.disabled = bDone.disabled = sel.busy;
+    bStopBatch.style.display = sel.busy ? 'inline-flex' : 'none';
+    bArchive.style.display = bDelete.style.display = sel.busy ? 'none' : 'inline-flex';
     dim(bArchive, bDelete, bAll, bNone, bMatch, bDone);
   }
 
@@ -775,8 +1020,8 @@
 
   bSelect.onclick = () => setSelect(!sel.on);
   bDone.onclick = () => setSelect(false);
-  bAll.onclick = () => { chatLinks().forEach((a) => sel.ids.add(chatId(a))); paintAll(); };
-  bNone.onclick = () => { sel.ids.clear(); paintAll(); };
+  bAll.onclick = () => { chatLinks().forEach((a) => sel.ids.add(chatId(a))); say('All loaded chats ticked. Scroll the sidebar to load older ones.'); paintAll(); };
+  bNone.onclick = () => { sel.ids.clear(); say(''); paintAll(); };
   bMatch.onclick = () => {
     const q = barFilter.value.trim().toLowerCase();
     if (!q) return barFilter.focus();
@@ -786,6 +1031,7 @@
     paintAll();
   };
   barFilter.addEventListener('keydown', (e) => { if (e.key === 'Enter') bMatch.onclick(); });
+  bStopBatch.onclick = () => { sel.stop = true; say('Stopping after this chat…'); };
 
   async function token() {
     const r = await fetch('/api/auth/session', { credentials: 'include' });
@@ -797,14 +1043,19 @@
   async function batch(kind) {
     const ids = [...sel.ids];
     if (!ids.length || sel.busy) return;
-    const verb = kind === 'delete' ? 'Delete' : 'Archive';
-    if (kind === 'delete' && !confirm(`Delete ${plural(ids.length, 'chat')}? Deleted chats can't be brought back. Archive keeps them under Settings → Archived chats.`)) return;
-    sel.busy = true; renderBar();
-    let ok = 0, fail = 0;
+    if (kind === 'delete') {
+      const names = ids.slice(0, 5).map((id) => `  • ${chatTitle(id)}`).join('\n');
+      const more = ids.length > 5 ? `\n  …and ${ids.length - 5} more` : '';
+      if (!confirm(`Delete ${plural(ids.length, 'chat')} for good?\n\n${names}${more}\n\nDeleted chats can't be brought back. Archive keeps them under Settings → Archived chats.`)) return;
+    }
+    sel.busy = true; sel.stop = false; renderBar();
+    let ok = 0;
+    const failed = [];
     try {
       const auth = await token();
       for (const id of ids) {
-        say(`${verb === 'Delete' ? 'Deleting' : 'Archiving'} ${ok + fail + 1} of ${ids.length}…`);
+        if (sel.stop) break;
+        say(`${kind === 'delete' ? 'Deleting' : 'Archiving'} ${ok + failed.length + 1} of ${ids.length}…`);
         const r = await fetch(`/backend-api/conversation/${id}`, {
           method: 'PATCH', credentials: 'include',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${auth}` },
@@ -813,14 +1064,16 @@
         if (r.ok) {
           ok++; sel.ids.delete(id);
           document.querySelectorAll(SEL.chat).forEach((a) => { if (chatId(a) === id) (a.closest(SEL.chatRow) || a).style.display = 'none'; });
-        } else fail++;
+        } else failed.push(chatTitle(id));
         await sleep(CFG.batchGapMs);
       }
-      say(`${kind === 'delete' ? 'Deleted' : 'Archived'} ${plural(ok, 'chat')}${fail ? `; ${fail} failed (try again, or reload the page)` : ''}. Reload the page to refresh the sidebar.`);
+      const did = `${kind === 'delete' ? 'Deleted' : 'Archived'} ${plural(ok, 'chat')}`;
+      const left = ids.length - ok - failed.length;
+      say(`${did}${left ? `, stopped with ${left} left ticked` : ''}${failed.length ? `. Couldn't ${kind}: ${failed.slice(0, 3).join(', ')}${failed.length > 3 ? ` and ${failed.length - 3} more` : ''} (still ticked; try again)` : ''}. Reload the page to refresh the sidebar.`, failed.length > 0);
     } catch (e) {
-      say(`Stopped after ${plural(ok, 'chat')}: ${e && e.message ? e.message : e}.`);
+      say(`Stopped after ${plural(ok, 'chat')}: ${e && e.message ? e.message : e}.`, true);
     }
-    sel.busy = false; paintAll();
+    sel.busy = false; sel.stop = false; paintAll();
     if (ids.length >= 10) notify(`${kind === 'delete' ? 'Deleted' : 'Archived'} ${plural(ok, 'chat')}.`);
   }
   bArchive.onclick = () => batch('archive');
@@ -829,7 +1082,13 @@
   // ---------- keyboard shortcuts ----------
   // Alt plus a letter, matched by key position so it also works where Alt types accented letters
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && sel.on && !sel.busy) { setSelect(false); return; }
+    if (e.key === 'Escape') {
+      if (menu.style.display !== 'none') { e.stopPropagation(); closeMenu(); bMore.focus(); return; }
+      if (sel.on && !sel.busy) { setSelect(false); return; }
+      // Esc closes the panel only when you're working in it, so ChatGPT keeps its own Esc
+      if (panel.style.display !== 'none' && panel.contains(document.activeElement)) { e.stopPropagation(); closePanel(); toggle.focus(); }
+      return;
+    }
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     const act = { KeyQ: togglePanel, KeyS: startOrPause, KeyX: () => !sel.busy && setSelect(!sel.on), KeyL: () => openPanel('library') }[e.code];
     if (!act) return;
