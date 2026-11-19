@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.1
+// @version      3.1.1
 // @description  Promptline (formerly ChatGPT Image Queue): queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -14,10 +14,10 @@
 // @connect      oaiusercontent.com
 // @connect      openai.com
 // @run-at       document-idle
-// @icon         https://raw.githubusercontent.com/Adztrz/chatgpt-image-queue/main/icon.png
-// @homepageURL  https://github.com/Adztrz/chatgpt-image-queue
-// @updateURL    https://raw.githubusercontent.com/Adztrz/chatgpt-image-queue/main/chatgpt-prompt-queue.user.js
-// @downloadURL  https://raw.githubusercontent.com/Adztrz/chatgpt-image-queue/main/chatgpt-prompt-queue.user.js
+// @icon         https://raw.githubusercontent.com/Adztrz/promptline/main/icon.png
+// @homepageURL  https://github.com/Adztrz/promptline
+// @updateURL    https://raw.githubusercontent.com/Adztrz/promptline/main/chatgpt-prompt-queue.user.js
+// @downloadURL  https://raw.githubusercontent.com/Adztrz/promptline/main/chatgpt-prompt-queue.user.js
 // ==/UserScript==
 
 (function () {
