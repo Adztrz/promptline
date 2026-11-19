@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         ChatGPT Image Queue
+// @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.0.1
-// @description  Queue image prompts, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
+// @version      3.1
+// @description  Promptline (formerly ChatGPT Image Queue): queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @grant        GM_getValue
@@ -263,8 +263,8 @@
   }
   function notify(text) {
     if (!settings.notify) return;
-    try { GM_notification({ title: 'Image queue', text, timeout: 10000, onclick: () => window.focus() }); }
-    catch (_) { try { new Notification('Image queue', { body: text }); } catch (__) { /* notifications off */ } }
+    try { GM_notification({ title: 'Promptline', text, timeout: 10000, onclick: () => window.focus() }); }
+    catch (_) { try { new Notification('Promptline', { body: text }); } catch (__) { /* notifications off */ } }
   }
 
   // Count every image ChatGPT finishes while this tab watches it being made, queued or not.
@@ -347,7 +347,7 @@
   const toggleTag = tag('Queue', C.bone, C.strong);
   const toggleCount = el('span', { font: `500 12px/1 ${MONO}`, color: C.muted });
   toggle.append(toggleTag, toggleCount);
-  toggle.title = 'Image queue (Alt+Q)';
+  toggle.title = 'Promptline (Alt+Q)';
 
   const panel = el('div', {
     position: 'fixed', right: '16px', bottom: '138px', zIndex: 99999, width: '412px', maxWidth: 'calc(100vw - 32px)', boxSizing: 'border-box',
@@ -356,7 +356,7 @@
 
   // header: tag on the left, count pill on the right
   const header = el('div', { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' });
-  const headTag = tag('Image queue');
+  const headTag = tag('Promptline');
   const pill = el('span', { minWidth: '20px', padding: '2px 8px', borderRadius: '9999px', background: 'rgba(255,255,255,.05)', font: `500 11px/1.4 ${MONO}`, color: C.muted, textAlign: 'center' });
   header.append(headTag, pill);
 
