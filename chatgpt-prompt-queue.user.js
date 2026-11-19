@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.1.1
+// @version      3.1.2
 // @description  Promptline (formerly ChatGPT Image Queue): queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -420,12 +420,26 @@
 
   // settings view
   const setView = el('div', { display: 'flex', flexDirection: 'column', gap: '12px' });
+  // drawn by hand: ChatGPT's page styles hide native checkboxes
   function checkRow(key, label, hint) {
-    const r = el('label', { display: 'grid', gridTemplateColumns: '18px 1fr', gap: '2px 10px', cursor: 'pointer', alignItems: 'start' });
-    const c = el('input', { margin: '2px 0 0', accentColor: C.bone, width: '16px', height: '16px' });
-    c.type = 'checkbox'; c.checked = settings[key];
-    c.onchange = () => { settings[key] = c.checked; saveSettings(); };
-    r.append(c, el('span', { color: C.strong }, label), el('span'), el('span', { fontSize: '12px', color: C.muted }, hint));
+    const r = el('div', { display: 'grid', gridTemplateColumns: '18px 1fr', gap: '2px 10px', cursor: 'pointer', alignItems: 'start' });
+    r.setAttribute('role', 'checkbox'); r.tabIndex = 0;
+    const box = el('span', {
+      display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '16px', height: '16px', marginTop: '2px', boxSizing: 'border-box',
+      borderRadius: '4px', font: `700 11px/1 ${SANS}`, color: C.canvas, transition: `background .15s ${EASE}, border-color .15s ${EASE}`,
+    });
+    const paint = () => {
+      const on = settings[key];
+      box.textContent = on ? '✓' : '';
+      box.style.background = on ? C.bone : 'transparent';
+      box.style.border = `1px solid ${on ? C.bone : C.rule}`;
+      r.setAttribute('aria-checked', String(on));
+    };
+    const flip = () => { settings[key] = !settings[key]; saveSettings(); paint(); render(); };
+    r.onclick = flip;
+    r.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); flip(); } });
+    paint();
+    r.append(box, el('span', { color: C.strong }, label), el('span'), el('span', { fontSize: '12px', color: C.muted }, hint));
     return r;
   }
   const prefixLabel = el('div', { color: C.strong }, 'File name prefix');
