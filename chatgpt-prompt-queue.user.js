@@ -2,8 +2,8 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.3.1
-// @description  Promptline (formerly ChatGPT Image Queue): queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
+// @version      3.3.2
+// @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @grant        GM_getValue

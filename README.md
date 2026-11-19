@@ -2,13 +2,12 @@
 
 # Promptline
 
-*Formerly ChatGPT Image Queue.* A Tampermonkey userscript for ChatGPT.
+A Tampermonkey userscript for ChatGPT.
 
 For daily ChatGPT image work: paste a list of prompts, and `chatgpt-prompt-queue.user.js` sends them one at a time, saves each image as it finishes, waits out usage limits, and lets you tidy the sidebar in bulk.
 
 **Install:** with Tampermonkey installed, open [the raw script](https://raw.githubusercontent.com/Adztrz/promptline/main/chatgpt-prompt-queue.user.js): Tampermonkey offers to install it and keeps it up to date from here. Or by hand: in Tampermonkey's dashboard, click **+**, replace the editor's contents with the file, save, then reload ChatGPT (a copy pasted by hand doesn't update itself). The first download and the first notification may each ask for permission once.
 
-**Coming from ChatGPT Image Queue?** It's the same script, renamed in 3.1. Tampermonkey normally updates it in place; if you end up with both, delete the old *ChatGPT Image Queue* entry. A copy installed fresh starts with an empty queue, library and settings.
 
 ## Queue
 
