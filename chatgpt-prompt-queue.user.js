@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.1.2
+// @version      3.1.3
 // @description  Promptline (formerly ChatGPT Image Queue): queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -41,8 +41,12 @@
     input: ['div#prompt-textarea[contenteditable="true"]', '.ProseMirror[contenteditable="true"]', 'form [contenteditable="true"]', 'textarea#prompt-textarea', 'form textarea'],
     send: ['button[data-testid="send-button"]', 'button#composer-submit-button', 'button[aria-label="Send prompt"]', 'button[aria-label*="Send"]'],
     stop: 'button[data-testid="stop-button"], button[aria-label^="Stop"]',
-    turn: '[data-message-author-role="assistant"]',
+    // one block per prompt and its reply; its state reads "in_progress" until the reply is done (Nov 2026 layout)
+    turn: '[data-talvt-turn-state]',
+    oldTurn: '[data-message-author-role="assistant"]',  // the layout before that
+    userBubble: '[data-user-message-bubble], [data-message-author-role="user"]',
     chat: 'nav a[href*="/c/"]',  // a chat in the sidebar
+    chatRow: '[role="listitem"], li',
   };
   const BUSY_TEXT = /creating image|generating image|image creation in progress/i;
   const LIMIT_TEXT = /(hit|reached) (the|your|our) .*limit|rate limit|too many requests/i;
@@ -55,8 +59,11 @@
   const findInput = () => first(SEL.input);
   const findSend = () => first(SEL.send);
   const boxText = (box) => (box.isContentEditable ? box.innerText : box.value).trim();
-  const lastTurn = () => { const t = document.querySelectorAll(SEL.turn); return t[t.length - 1] || null; };
-  const turnCount = () => document.querySelectorAll(SEL.turn).length;
+  const turns = () => { const t = document.querySelectorAll(SEL.turn); return t.length ? t : document.querySelectorAll(SEL.oldTurn); };
+  const lastTurn = () => { const t = turns(); return t[t.length - 1] || null; };
+  const turnCount = () => turns().length;
+  // the reply's own text, without the prompt that asked for it
+  const replyText = (t) => { let s = t.innerText || ''; for (const u of t.querySelectorAll(SEL.userBubble)) s = s.replace(u.innerText, ''); return s; };
   const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 
@@ -94,13 +101,16 @@
     if ($(SEL.stop)) return true;
     const t = lastTurn();
     if (!t) return false;
-    if (BUSY_TEXT.test(t.innerText || '')) return true;
+    const st = t.getAttribute('data-talvt-turn-state');
+    if (st && st !== 'complete') return true;
+    if (BUSY_TEXT.test(replyText(t))) return true;
     return [...t.querySelectorAll('img')].some((img) => !img.complete);
   }
   // only a limit message that arrived after the last one we handled counts
-  const limitHit = () => turnCount() > state.limitSeenAt && LIMIT_TEXT.test((lastTurn() || {}).innerText || '');
+  const limitHit = () => turnCount() > state.limitSeenAt && !!lastTurn() && LIMIT_TEXT.test(replyText(lastTurn()));
+  // generated images only: pictures you attached to the prompt are left out
   const bigImages = (turn) => [...new Set([...turn.querySelectorAll('img')]
-    .filter((i) => i.complete && i.naturalWidth >= CFG.minImagePx).map((i) => i.currentSrc || i.src))];
+    .filter((i) => i.complete && i.naturalWidth >= CFG.minImagePx && !i.closest(SEL.userBubble)).map((i) => i.currentSrc || i.src))];
 
   async function waitFor(fn, ms) {
     const end = Date.now() + ms;
@@ -167,14 +177,15 @@
   const fileName = (i, k) => `${settings.prefix.replace(/[\\/:*?"<>|]+/g, '-')}${String(i + 1).padStart(3, '0')}-${slug(state.queue[i] || '') || 'image'}${k ? `-${k + 1}` : ''}.png`;
 
   function download(url, name) {
+    const save = (href) => { const a = document.createElement('a'); a.href = href; a.download = name; document.body.append(a); a.click(); a.remove(); };
+    // ChatGPT now shows generated images as blob: links, which only the page itself can read: save those directly
+    if (/^(blob|data):/.test(url)) return save(url);
     // the page's own fetch carries the ChatGPT sign-in, so it is the fallback when GM_download is refused
     const viaPage = async () => {
       try {
-        const blob = await (await fetch(url, { credentials: 'include' })).blob();
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob); a.download = name;
-        document.body.append(a); a.click(); a.remove();
-        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+        const href = URL.createObjectURL(await (await fetch(url, { credentials: 'include' })).blob());
+        save(href);
+        setTimeout(() => URL.revokeObjectURL(href), 10000);
       } catch (_) { setStatus(`Couldn't download ${name}.`, true); }
     };
     try { GM_download({ url, name, saveAs: false, onerror: viaPage }); } catch (_) { viaPage(); }
@@ -228,7 +239,7 @@
         state.limitSeenAt = turnCount();
         // the last prompt got the limit message instead of an image, so it goes again
         if (state.idx > 0) { state.idx--; state.got = state.got.filter((g) => g !== state.idx); save(); render(); }
-        const until = Date.now() + limitWait(lastTurn().innerText || '');
+        const until = Date.now() + limitWait(replyText(lastTurn()));
         updateDaily((d) => { d.resetAt = until; });
         if (!settings.autoResume) return pause(`ChatGPT says you hit a limit. Try again around ${clock(until)}.`);
         notify(`Limit hit. The queue resumes around ${clock(until)}.`);
@@ -764,7 +775,7 @@
         });
         if (r.ok) {
           ok++; sel.ids.delete(id);
-          document.querySelectorAll(SEL.chat).forEach((a) => { if (chatId(a) === id) (a.closest('li') || a).style.display = 'none'; });
+          document.querySelectorAll(SEL.chat).forEach((a) => { if (chatId(a) === id) (a.closest(SEL.chatRow) || a).style.display = 'none'; });
         } else fail++;
         await sleep(CFG.batchGapMs);
       }
