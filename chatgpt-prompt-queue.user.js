@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.2
+// @version      3.2.1
 // @description  Promptline (formerly ChatGPT Image Queue): queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -364,14 +364,34 @@
     return f;
   }
 
-  // the launcher: a quiet button with the progress in it
+  // the logo (same drawing as icon.svg): a stack of image cards with a play badge, built node by node
+  function logo(px) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 128 128');
+    svg.setAttribute('width', px); svg.setAttribute('height', px);
+    svg.style.display = 'block'; svg.style.flex = 'none';
+    const add = (tagName, attrs) => { const e = document.createElementNS(NS, tagName); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); svg.append(e); return e; };
+    add('rect', { width: 128, height: 128, rx: 28, fill: C.canvas });
+    add('rect', { x: 42, y: 18, width: 64, height: 50, rx: 10, fill: C.raised, stroke: C.faint, 'stroke-width': 3 });
+    add('rect', { x: 31, y: 29, width: 66, height: 52, rx: 10, fill: C.raised, stroke: C.muted, 'stroke-width': 3 });
+    add('rect', { x: 18, y: 42, width: 72, height: 58, rx: 11, fill: C.bone });
+    add('circle', { cx: 68, cy: 58, r: 7, fill: C.canvas });
+    add('path', { d: 'M26 92 L46 66 L58 80 L66 72 L82 92 Z', fill: C.canvas });
+    svg.badge = add('circle', { cx: 96, cy: 96, r: 20, fill: C.positive, stroke: C.canvas, 'stroke-width': 5 });
+    add('path', { d: 'M90 85 L105 96 L90 107 Z', fill: C.canvas });
+    return svg;
+  }
+
+  // the launcher: the logo, with the progress beside it once there is a queue
   const toggle = button('', 'plain');
-  Object.assign(toggle.style, { position: 'fixed', right: '16px', bottom: '96px', zIndex: 99999, gap: '8px', background: C.card, boxShadow: '0 4px 16px rgba(0,0,0,.45)' });
+  Object.assign(toggle.style, { position: 'fixed', right: '16px', bottom: '96px', zIndex: 99999, gap: '8px', height: '36px', padding: '0 6px', background: C.card, boxShadow: '0 4px 16px rgba(0,0,0,.45)' });
   hover(toggle, { borderColor: C.rule, background: C.raised }, { borderColor: C.border, background: C.card });
-  const toggleTag = tag('Queue', C.bone, C.strong);
-  const toggleCount = el('span', { font: `500 12px/1 ${MONO}`, color: C.muted });
-  toggle.append(toggleTag, toggleCount);
+  const toggleLogo = logo(24);
+  const toggleCount = el('span', { font: `500 12px/1 ${MONO}`, color: C.muted, marginRight: '4px' });
+  toggle.append(toggleLogo, toggleCount);
   toggle.title = 'Promptline (Alt+Q)';
+  let badgePulse = null;
 
   const panel = el('div', {
     position: 'fixed', right: '16px', bottom: '138px', zIndex: 99999, width: '412px', maxWidth: 'calc(100vw - 32px)', boxSizing: 'border-box',
@@ -548,7 +568,10 @@
     const n = state.queue.length;
     pill.textContent = n ? `${state.idx} / ${n}` : '0';
     toggleCount.textContent = n ? `${state.idx}/${n}` : '';
-    toggleTag.dot.style.background = state.running ? C.positive : C.bone;
+    toggleCount.style.display = n ? 'inline' : 'none';
+    // the play badge breathes while the queue runs
+    if (state.running && !badgePulse) badgePulse = pulse(toggleLogo.badge);
+    if (!state.running && badgePulse) { badgePulse.cancel(); badgePulse = null; }
 
     for (const [k, b] of Object.entries(tabBtns)) { b.active = k === tab; b.style.color = b.active ? C.strong : C.muted; }
     bSelect.style.color = sel.on ? C.strong : C.muted;
