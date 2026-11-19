@@ -22,10 +22,10 @@ The line under the header counts the prompts sent and images made today, queued 
 
 ## Select chats
 
-Click **Select chats** (or press **Alt+X**). Clicking a chat in the sidebar now ticks it instead of opening it; **Shift**-click ticks a range. **Select matching** ticks every loaded chat whose title contains your text, and **All** ticks every loaded chat (scroll the sidebar to load older ones). Then:
+Click the list icon next to the progress in the panel header (or press **Alt+X**). Clicking a chat in the sidebar now ticks it instead of opening it; **Shift**-click ticks a range. **Select matching** ticks every loaded chat whose title contains your text, and **All** ticks every loaded chat (scroll the sidebar to load older ones). Then:
 
 - **Archive** moves them to Settings → Archived chats, where they can be restored.
-- **Delete** removes them for good, after asking first.
+- **Delete…** removes them for good, after showing you which chats. **Stop** halts a running batch.
 
 Reload the page afterwards to refresh the sidebar. **Esc** or **Done** leaves selection. This uses the same private endpoint as ChatGPT's own menu, so it may need an update if ChatGPT changes it.
 
