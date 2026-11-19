@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.1.4
+// @version      3.2
 // @description  Promptline (formerly ChatGPT Image Queue): queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -80,7 +80,7 @@
   if (GM_getValue('running', false)) state.note = 'Paused because the page reloaded. Press Start to continue.';
   const save = () => { GM_setValue('queue', state.queue); GM_setValue('idx', state.idx); GM_setValue('got', state.got); GM_setValue('running', state.running); };
 
-  const settings = { download: true, prefix: '', autoResume: true, notify: true, ...GM_getValue('settings', {}) };
+  const settings = { download: true, png: true, prefix: '', autoResume: true, notify: true, ...GM_getValue('settings', {}) };
   const saveSettings = () => GM_setValue('settings', settings);
   let library = GM_getValue('library', []);  // [{ name, text }]
   const saveLibrary = () => GM_setValue('library', library);
@@ -174,21 +174,34 @@
 
   // ---------- downloads ----------
   const slug = (t) => t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').split('-').slice(0, 6).join('-').slice(0, 40);
-  const fileName = (i, k) => `${settings.prefix.replace(/[\\/:*?"<>|]+/g, '-')}${String(i + 1).padStart(3, '0')}-${slug(state.queue[i] || '') || 'image'}${k ? `-${k + 1}` : ''}.png`;
+  // the extension is set when saving, from what the file really is
+  const fileName = (i, k) => `${settings.prefix.replace(/[\\/:*?"<>|]+/g, '-')}${String(i + 1).padStart(3, '0')}-${slug(state.queue[i] || '') || 'image'}${k ? `-${k + 1}` : ''}`;
+  const EXT = { 'image/png': 'png', 'image/webp': 'webp', 'image/jpeg': 'jpg' };
 
-  function download(url, name) {
-    const save = (href) => { const a = document.createElement('a'); a.href = href; a.download = name; document.body.append(a); a.click(); a.remove(); };
-    // ChatGPT now shows generated images as blob: links, which only the page itself can read: save those directly
-    if (/^(blob|data):/.test(url)) return save(url);
-    // the page's own fetch carries the ChatGPT sign-in, so it is the fallback when GM_download is refused
-    const viaPage = async () => {
-      try {
-        const href = URL.createObjectURL(await (await fetch(url, { credentials: 'include' })).blob());
-        save(href);
-        setTimeout(() => URL.revokeObjectURL(href), 10000);
-      } catch (_) { setStatus(`Couldn't download ${name}.`, true); }
-    };
-    try { GM_download({ url, name, saveAs: false, onerror: viaPage }); } catch (_) { viaPage(); }
+  // Redraw an image as PNG. ChatGPT stores its images as WebP; the PNG has the same pixels, in a bigger file.
+  async function toPng(blob) {
+    const bmp = await createImageBitmap(blob);
+    const c = document.createElement('canvas');
+    c.width = bmp.width; c.height = bmp.height;
+    c.getContext('2d').drawImage(bmp, 0, 0);
+    return new Promise((r, no) => c.toBlob((b) => (b ? r(b) : no(new Error('PNG failed'))), 'image/png'));
+  }
+
+  async function download(url, name) {
+    // ChatGPT shows its images as blob: links that only the page can read, and its own fetch carries the sign-in
+    try {
+      let blob = await (await fetch(url, { credentials: 'include' })).blob();
+      if (settings.png && blob.type !== 'image/png') blob = await toPng(blob);
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = href; a.download = `${name}.${EXT[blob.type] || 'png'}`;
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(href), 10000);
+    } catch (_) {
+      // the page can't read it (an image on another site): Tampermonkey fetches it instead
+      try { GM_download({ url, name: `${name}.png`, saveAs: false, onerror: () => setStatus(`Couldn't download ${name}.`, true) }); }
+      catch (__) { setStatus(`Couldn't download ${name}.`, true); }
+    }
   }
 
   // After prompt i has finished, save the images in the last reply once.
@@ -465,6 +478,7 @@
   testRow.append(bTestNote);
   setView.append(
     checkRow('download', 'Download images automatically', 'Each image is saved as soon as its prompt finishes, named by queue number and prompt.'),
+    checkRow('png', 'Save as PNG', 'ChatGPT makes WebP images. On: each is converted to PNG, same pixels in a bigger file. Off: the original WebP is kept.'),
     prefixLabel, prefixInput,
     checkRow('autoResume', 'Wait out limits and resume', 'When ChatGPT says you hit a limit, wait until it resets, then send that prompt again.'),
     checkRow('notify', 'Desktop notifications', 'When the queue finishes, pauses, or waits on a limit.'),

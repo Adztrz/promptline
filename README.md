@@ -14,7 +14,7 @@ For daily ChatGPT image work: paste a list of prompts, and `chatgpt-prompt-queue
 
 Click **Queue** (or press **Alt+Q**), paste one prompt per line, click **Load prompts**, then **Start**. Each prompt gets its own card showing whether it's queued, next, generating, sent or saved; click a card's text to see the whole prompt. Don't type in the chat box while it runs, and keep the tab open.
 
-- **Downloads:** each finished image is saved straight to your downloads folder, named by queue number and prompt, such as `cozy-007-a-small-wooden-cabin-beside-a.png`. Set the `cozy-` part under **Settings → File name prefix**.
+- **Downloads:** each finished image is saved straight to your downloads folder, named by queue number and prompt, such as `cozy-007-a-small-wooden-cabin-beside-a.png`. Set the `cozy-` part under **Settings → File name prefix**. ChatGPT makes its images as WebP; **Save as PNG** (on by default) converts each one, or turn it off to keep the WebP.
 - **Limits:** when ChatGPT says you hit a limit, the queue reads when it resets, counts down, and sends that prompt again. Turn this off in Settings to pause instead.
 - It also pauses on a reply over 8 minutes, a page reload, or if it can't send. **Check** shows what the script can find, for when ChatGPT changes its page.
 
