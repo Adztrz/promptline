@@ -2,7 +2,7 @@
 // @name         ChatGPT Image Queue
 // @namespace    adztrz
 // @license      MIT
-// @version      3.0
+// @version      3.0.1
 // @description  Queue image prompts, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -14,6 +14,7 @@
 // @connect      oaiusercontent.com
 // @connect      openai.com
 // @run-at       document-idle
+// @icon         https://raw.githubusercontent.com/Adztrz/chatgpt-image-queue/main/icon.png
 // @homepageURL  https://github.com/Adztrz/chatgpt-image-queue
 // @updateURL    https://raw.githubusercontent.com/Adztrz/chatgpt-image-queue/main/chatgpt-prompt-queue.user.js
 // @downloadURL  https://raw.githubusercontent.com/Adztrz/chatgpt-image-queue/main/chatgpt-prompt-queue.user.js

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Image queue: a stack of image cards with a play badge, in the panel's colours -->
+  <rect width="128" height="128" rx="28" fill="#07090b"/>
+  <rect x="42" y="18" width="64" height="50" rx="10" fill="#1a1d1e" stroke="#565858" stroke-width="3"/>
+  <rect x="31" y="29" width="66" height="52" rx="10" fill="#1a1d1e" stroke="#8a8b8a" stroke-width="3"/>
+  <rect x="18" y="42" width="72" height="58" rx="11" fill="#e9e1dc"/>
+  <circle cx="68" cy="58" r="7" fill="#07090b"/>
+  <path d="M26 92 L46 66 L58 80 L66 72 L82 92 Z" fill="#07090b"/>
+  <circle cx="96" cy="96" r="20" fill="#55bc82" stroke="#07090b" stroke-width="5"/>
+  <path d="M90 85 L105 96 L90 107 Z" fill="#07090b"/>
+</svg>

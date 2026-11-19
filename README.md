@@ -1,3 +1,5 @@
+<img src="icon.svg" width="96" alt="">
+
 # ChatGPT Tampermonkey Image Queue
 
 A Tampermonkey userscript for daily ChatGPT image work. Paste a list of prompts, and `chatgpt-prompt-queue.user.js` sends them one at a time, saves each image as it finishes, waits out usage limits, and lets you tidy the sidebar in bulk.
