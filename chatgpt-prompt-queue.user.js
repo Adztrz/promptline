@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.1.3
+// @version      3.1.4
 // @description  Promptline (formerly ChatGPT Image Queue): queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -263,8 +263,8 @@
     }
     if (!state.running) return;
     state.running = false; save(); render();
-    setStatus(`Done: all ${state.queue.length} prompts sent.`);
-    notify(`Done: all ${state.queue.length} prompts sent.`);
+    setStatus(`Done: ${plural(state.queue.length, 'prompt')} sent.`);
+    notify(`Done: ${plural(state.queue.length, 'prompt')} sent.`);
   }
 
   function pause(msg, bad = true) {
@@ -559,7 +559,7 @@
     bSkip.disabled = state.running || state.idx >= n;
     bEdit.disabled = bClear.disabled = state.running;
     dim(bLoad, bStart, bPause, bSkip, bEdit, bClear);
-    setStatus(state.note || (n && state.idx >= n ? `Done: all ${n} prompts sent.` : n ? 'Ready. Leave the chat box alone while it runs.' : ''), state.bad);
+    setStatus(state.note || (n && state.idx >= n ? `Done: ${plural(n, 'prompt')} sent.` : n ? 'Ready. Leave the chat box alone while it runs.' : ''), state.bad);
     renderToday();
     if (tab === 'library') renderLibrary();
   }
