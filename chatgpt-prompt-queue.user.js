@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.5.0
+// @version      3.5.1
 // @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -559,8 +559,8 @@
     toggle.animate(calm() ? [{ boxShadow: `0 0 0 2px ${g}.7), 0 4px 16px rgba(0,0,0,.45)` }, { boxShadow: '0 4px 16px rgba(0,0,0,.45)' }]
       : [{ boxShadow: `0 0 0 0 ${g}.6), 0 4px 16px rgba(0,0,0,.45)` }, { boxShadow: `0 0 0 14px ${g}0), 0 4px 16px rgba(0,0,0,.45)` }], { duration: calm() ? 400 : 900, easing: ARRIVE });
   }
-  toggle.title = 'Promptline (Alt+Q)';
-  toggle.setAttribute('aria-label', 'Promptline (Alt+Q)');
+  toggle.title = 'Promptline (Alt+Shift+P)';
+  toggle.setAttribute('aria-label', 'Promptline (Alt+Shift+P)');
   toggle.setAttribute('aria-controls', 'pl-panel');
   let badgePulse = null;
 
@@ -724,7 +724,7 @@
   testRow.append(bTestNote);
   const keysHead = el('div', { color: C.strong, marginTop: '4px' }, 'Keyboard shortcuts');
   const keys = el('div', { display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '8px 12px', alignItems: 'center', fontSize: '12px', color: C.text });
-  for (const [k, what] of [[['Alt', 'Q'], 'Open or close this panel'], [['Alt', 'S'], 'Start or pause the queue'], [['Alt', 'X'], 'Select chats in the sidebar'], [['Alt', 'L'], 'Prompt library'], [['Alt', 'R'], 'Put your last prompt, with its pictures, back in the chat box'], [['Esc'], 'Close a menu, leave selection, or close the panel']]) {
+  for (const [k, what] of [[['Alt', 'Shift', 'P'], 'Open or close this panel'], [['Alt', 'S'], 'Start or pause the queue'], [['Alt', 'X'], 'Select chats in the sidebar'], [['Alt', 'L'], 'Prompt library'], [['Alt', 'R'], 'Put your last prompt, with its pictures, back in the chat box'], [['Esc'], 'Close a menu, leave selection, or close the panel']]) {
     const combo = el('span', { display: 'inline-flex', gap: '4px', alignItems: 'center' });
     k.forEach((x, i) => { if (i) combo.append(el('span', { color: C.faint, fontSize: '11px' }, '+')); combo.append(kbd(x)); });
     keys.append(combo, el('span', {}, what));
@@ -1370,8 +1370,10 @@
       if (panel.style.display !== 'none' && panel.contains(document.activeElement)) { e.stopPropagation(); closePanel(); toggle.focus(); }
       return;
     }
-    if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
-    const act = { KeyQ: togglePanel, KeyS: startOrPause, KeyX: () => !sel.busy && setSelect(!sel.on), KeyL: () => openPanel('library'), KeyR: () => repeatLast(false) }[e.code];
+    if (!e.altKey || e.ctrlKey || e.metaKey) return;
+    // the panel is Alt+Shift+P: Alt+Q closes windows on some setups
+    if (e.shiftKey) { if (e.code === 'KeyP') { e.preventDefault(); e.stopPropagation(); togglePanel(); } return; }
+    const act = { KeyS: startOrPause, KeyX: () => !sel.busy && setSelect(!sel.on), KeyL: () => openPanel('library'), KeyR: () => repeatLast(false) }[e.code];
     if (!act) return;
     e.preventDefault(); e.stopPropagation();
     act();
