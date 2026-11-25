@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.4.0
+// @version      3.4.1
 // @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -753,6 +753,7 @@
 
   let editing = !state.queue.length;
   let pulseAnim = null;
+  const cards = [];  // the queue's cards, kept between redraws: [{ sig, li }]
   let shownIdx = -1;  // the card last scrolled into view, so a re-render doesn't yank the list
 
   function setStatus(t, bad = false) { state.note = t; state.bad = bad; status.textContent = t; status.style.color = bad ? C.alert : C.muted; }
@@ -785,7 +786,7 @@
       : sent ? tag(state.got.includes(i) && settings.download ? 'Saved' : 'Sent', C.positive)
       : next ? tag('Next', C.bone, C.text)
       : tag('Queued', C.faint, C.faint);
-    if (working) pulseAnim = pulse(label.dot);
+    li.dot = label.dot;
     li.append(num, label, clampText(text, sent ? C.muted : C.text, 3));
     if (pics) li.append(el('span'), el('span', { font: `500 11px/1.4 ${MONO}`, color: C.faint }, `+ ${plural(pics, 'picture')}`));
     return li;
@@ -843,8 +844,24 @@
     found.textContent = cnt ? `${plural(cnt, 'prompt')} found${n && state.idx < n ? ` · loading replaces the ${n - state.idx} not sent yet` : ''}` : 'One prompt per line. Numbers like "1." are removed.';
     bLoad.disabled = !cnt;
 
-    if (pulseAnim) { pulseAnim.cancel(); pulseAnim = null; }
-    list.replaceChildren(...state.queue.map(card));
+    // A card is rebuilt only when what it shows changes; the rest stay as they are (a long queue redrew every card on
+    // every Skip and every sent prompt). An opened card also stays open.
+    const workingIdx = state.running && !state.waitUntil ? state.idx - 1 : -1;
+    const items = state.queue.map((q, i) => {
+      const sig = JSON.stringify([qText(q), qMedia(q).length, i < state.idx, i === state.idx, i === workingIdx, state.got.includes(i) && settings.download]);
+      const c = cards[i];
+      if (c && c.sig === sig) return c.li;
+      const li = card(q, i);
+      cards[i] = { sig, li };
+      return li;
+    });
+    cards.length = n;
+    items.forEach((li, i) => { const cur = list.children[i]; if (cur !== li) { if (cur) list.replaceChild(li, cur); else list.append(li); } });
+    while (list.children.length > n) list.lastChild.remove();
+    // the dot of the card being generated breathes
+    const wl = workingIdx >= 0 ? items[workingIdx] : null;
+    if (pulseAnim && pulseAnim.li !== wl) { pulseAnim.cancel(); pulseAnim = null; }
+    if (wl && !pulseAnim) { pulseAnim = pulse(wl.dot); pulseAnim.li = wl; }
     // bring the current card into view only when the position moves
     const focusIdx = Math.min(Math.max(state.idx - (state.running ? 1 : 0), 0), n - 1);
     if (focusIdx !== shownIdx && panel.style.display !== 'none' && tab === 'queue' && list.children[focusIdx]) {
@@ -1166,7 +1183,25 @@
   }
   // the sidebar loads more chats as it scrolls, and React redraws links: tick boxes go on whatever appears
   // (changes inside our own panel and bar are ignored, or repainting the bar would wake it again forever)
-  const watcher = new MutationObserver((recs) => { if (recs.some((r) => !ours(r.target))) paintAll(); });
+  // Only links that appear or are redrawn get painted: the whole page changes on every streamed word of a reply, and
+  // re-checking every sidebar chat each time kept the page busy for the whole reply.
+  let barQueued = false;
+  const watcher = new MutationObserver((recs) => {
+    const fresh = new Set();
+    for (const r of recs) {
+      if (ours(r.target)) continue;
+      const link = r.target.closest && r.target.closest(SEL.chat);
+      if (link) fresh.add(link);  // React redrew a link's insides, and our tick box went with them
+      for (const n of r.addedNodes) {
+        if (n.nodeType !== 1) continue;
+        if (n.matches(SEL.chat)) fresh.add(n);
+        else if (n.firstElementChild) n.querySelectorAll(SEL.chat).forEach((a) => fresh.add(a));
+      }
+    }
+    if (!fresh.size) return;
+    fresh.forEach(paintLink);
+    if (!barQueued) { barQueued = true; queueMicrotask(() => { barQueued = false; renderBar(); }); }
+  });
 
   function setSelect(on) {
     sel.on = on;
