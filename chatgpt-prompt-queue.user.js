@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.5.3
+// @version      3.5.4
 // @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -11,6 +11,7 @@
 // @grant        GM_notification
 // @grant        GM_download
 // @grant        GM_addStyle
+// @grant        unsafeWindow
 // @connect      chatgpt.com
 // @connect      oaiusercontent.com
 // @connect      openai.com
@@ -197,21 +198,39 @@
   const composer = (box) => (box && (box.closest('form') || box.parentElement?.parentElement)) || null;
   const attachedCount = (box) => { const f = composer(box); return f ? [...f.querySelectorAll('img')].filter((i) => !ours(i)).length : 0; };
 
-  // Attach pictures the way you would: through ChatGPT's own file picker, or by pasting them if that doesn't take.
+  // Attach pictures the way you would. Ways are tried in turn until ChatGPT shows them in the chat box:
+  // 1. its own file picker, with files made by the page itself. In Firefox, Tampermonkey runs scripts in a sandbox, and
+  //    files or events the sandbox makes can be invisible to the page, so the picker silently gets nothing;
+  // 2. the same picker with files made here (what works in Chrome);
+  // 3. dropping them on the chat box, as you would from a folder; 4. pasting them, where the browser keeps files on a
+  //    pasted event (Firefox doesn't).
+  // Only file pickers inside the chat box are used, so a picture never lands in a project's Sources instead.
   // Returns '' when they're in, or what went wrong.
+  const PW = typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
   async function attach(box, ids) {
     if (!ids.length) return '';
     const files = await filesOf(ids);
     if (!files.length) return 'The pictures saved with this prompt are gone.';
-    const before = attachedCount(box), want = before + files.length;
-    const pack = () => { const dt = new DataTransfer(); files.forEach((f) => dt.items.add(f)); return dt; };
-    const input = [...document.querySelectorAll('input[type="file"]')].find((i) => !ours(i) && (!i.accept || /image|\*/.test(i.accept)));
-    if (input) { input.files = pack().files; input.dispatchEvent(new Event('change', { bubbles: true })); }
-    if (input && (await waitFor(() => attachedCount(box) >= want, 6000))) return '';
-    box.focus();
-    box.dispatchEvent(new ClipboardEvent('paste', { clipboardData: pack(), bubbles: true, cancelable: true }));
-    if (await waitFor(() => attachedCount(box) >= want, 6000)) return '';
-    return "Couldn't attach the pictures. Attach them by hand, or open More → Check page.";
+    const want = attachedCount(box) + files.length;
+    // a DataTransfer holding the files, made by the page (W = PW) or by this script (W = window)
+    const pack = (W) => { const dt = new W.DataTransfer(); for (const f of files) dt.items.add(W === window ? f : new W.File([f], f.name, { type: f.type })); return dt; };
+    const form = composer(box);
+    const pickers = form ? [...form.querySelectorAll('input[type="file"]')].filter((i) => !ours(i)) : [];
+    const input = pickers.find((i) => i.multiple && /image/.test(i.accept)) || pickers.find((i) => /image/.test(i.accept)) || pickers.find((i) => !i.accept);
+    const pick = (W) => () => { input.files = pack(W).files; input.dispatchEvent(new W.Event('change', { bubbles: true })); };
+    const pasteKeepsFiles = (() => { try { return new PW.ClipboardEvent('paste', { clipboardData: pack(PW) }).clipboardData.files.length > 0; } catch (_) { return false; } })();
+    const ways = [
+      ...(input ? [pick(PW), ...(PW !== window ? [pick(window)] : [])] : []),
+      () => { const dt = pack(PW); for (const type of ['dragenter', 'dragover', 'drop']) box.dispatchEvent(new PW.DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true })); },
+      ...(pasteKeepsFiles ? [() => { box.focus(); box.dispatchEvent(new PW.ClipboardEvent('paste', { clipboardData: pack(PW), bubbles: true, cancelable: true })); }] : []),
+    ];
+    let why = '';
+    for (const way of ways) {
+      try { way(); } catch (e) { why = e && e.message ? e.message : String(e); continue; }
+      if (await waitFor(() => attachedCount(box) >= want, 4000)) return '';
+      if (attachedCount(box) > want - files.length) break;  // some went in: stop, rather than attach them twice
+    }
+    return `Couldn't attach the pictures${why ? ` (${why})` : ''}. Attach them by hand, or open More → Check page.`;
   }
 
   // Returns '' when sent, or what went wrong. Pictures go in first, then the text.
@@ -1003,7 +1022,8 @@
     const box = findInput();
     if (!box) return libSay("Couldn't find the chat box.");
     if (ids.length) libSay('Attaching the pictures…');
-    const bad = await attach(box, ids);
+    let bad;
+    try { bad = await attach(box, ids); } catch (e) { bad = `Something went wrong: ${e && e.message ? e.message : e}`; }
     if (bad) return libSay(bad);
     if (!text) { box.focus(); return libSay(`Attached ${plural(ids.length, 'picture')}.`); }
     const cur = boxText(box);
@@ -1172,7 +1192,8 @@
     if (!last) return tell('Nothing sent yet. Send a prompt, and it shows up here.');
     if (state.running) return tell('The queue is running. Pause it first.');
     if (panel.style.display !== 'none') libSay(send ? 'Sending it again…' : 'Putting it in the chat box…');
-    const err = await sendPrompt(last.text, last.media, !send);
+    let err;
+    try { err = await sendPrompt(last.text, last.media, !send); } catch (e) { err = `Something went wrong: ${e && e.message ? e.message : e}`; }
     if (err) return tell(err);
     if (send) { updateDaily((d) => { d.sent++; }); setLast(last.text, last.media); libSay('Sent again.'); }
     else { findInput()?.focus(); if (panel.style.display !== 'none') libSay('In the chat box. Change it if you like, then send.'); }
