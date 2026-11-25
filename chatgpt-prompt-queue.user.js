@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.4.1
+// @version      3.5.0
 // @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -277,6 +277,7 @@
     const imgs = bigImages(t);
     state.runImages += imgs.length;
     if (settings.download) imgs.forEach((src, k) => download(src, fileName(i, k)));
+    if (imgs.length) ring();
   }
 
   // ---------- limits ----------
@@ -473,6 +474,18 @@
     t.dot = d;
     return t;
   }
+  // ---------- motion: feedback, state and where things come from; never a wait ----------
+  // Arrivals decelerate, exits are quicker. With reduced motion there's no movement, only short fades.
+  const calm = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const ARRIVE = 'cubic-bezier(0.16, 1, 0.3, 1)', LEAVE = 'cubic-bezier(0.4, 0, 1, 1)';
+  function enter(e, { y = 6, scale = 1, ms = 180, origin, delay = 0 } = {}) {
+    if (!e.animate) return null;
+    if (calm()) return e.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 120, delay, fill: 'backwards' });
+    if (origin) e.style.transformOrigin = origin;
+    return e.animate([{ opacity: 0, transform: `translateY(${y}px) scale(${scale})` }, { opacity: 1, transform: 'none' }], { duration: ms, easing: ARRIVE, delay, fill: 'backwards' });
+  }
+  // a short glow that fades: "this is the one that just changed"
+  const settle = (e, from, to, ms = 600) => e.animate && e.animate([{ boxShadow: from }, { boxShadow: to }], { duration: calm() ? 200 : ms, easing: 'ease-out' });
   const pulse = (e) => e.animate([{ opacity: 1 }, { opacity: .25 }, { opacity: 1 }], { duration: 1600, iterations: Infinity, easing: 'ease-in-out' });
   const fieldStyle = {
     width: '100%', boxSizing: 'border-box', padding: '0 12px', height: H, borderRadius: '8px', border: `1px solid ${C.border}`,
@@ -539,6 +552,13 @@
   const toggleLogo = logo(24);
   const toggleCount = el('span', { font: `500 12px/1 ${MONO}`, color: C.muted, marginRight: '4px', fontVariantNumeric: 'tabular-nums' });
   toggle.append(toggleLogo, toggleCount);
+  // the focal moment: an image saved while you look elsewhere sends one green ring out of the launcher
+  function ring() {
+    if (!toggle.animate) return;
+    const g = `rgba(85,188,130,`;
+    toggle.animate(calm() ? [{ boxShadow: `0 0 0 2px ${g}.7), 0 4px 16px rgba(0,0,0,.45)` }, { boxShadow: '0 4px 16px rgba(0,0,0,.45)' }]
+      : [{ boxShadow: `0 0 0 0 ${g}.6), 0 4px 16px rgba(0,0,0,.45)` }, { boxShadow: `0 0 0 14px ${g}0), 0 4px 16px rgba(0,0,0,.45)` }], { duration: calm() ? 400 : 900, easing: ARRIVE });
+  }
   toggle.title = 'Promptline (Alt+Q)';
   toggle.setAttribute('aria-label', 'Promptline (Alt+Q)');
   toggle.setAttribute('aria-controls', 'pl-panel');
@@ -847,17 +867,25 @@
     // A card is rebuilt only when what it shows changes; the rest stay as they are (a long queue redrew every card on
     // every Skip and every sent prompt). An opened card also stays open.
     const workingIdx = state.running && !state.waitUntil ? state.idx - 1 : -1;
+    const changed = [];
     const items = state.queue.map((q, i) => {
       const sig = JSON.stringify([qText(q), qMedia(q).length, i < state.idx, i === state.idx, i === workingIdx, state.got.includes(i) && settings.download]);
       const c = cards[i];
       if (c && c.sig === sig) return c.li;
       const li = card(q, i);
+      if (c) changed.push([li, JSON.parse(c.sig), JSON.parse(sig)]);  // the same prompt, in a new state
       cards[i] = { sig, li };
       return li;
     });
     cards.length = n;
     items.forEach((li, i) => { const cur = list.children[i]; if (cur !== li) { if (cur) list.replaceChild(li, cur); else list.append(li); } });
     while (list.children.length > n) list.lastChild.remove();
+    // a card that changed state shows it: its label eases in; generating draws its outline, finishing lets it settle
+    if (panel.style.display !== 'none') for (const [li, was, now] of changed) {
+      enter(li.children[1], { y: 3, ms: 160 });
+      if (now[4] && !was[4]) settle(li, `inset 0 0 0 1px ${C.divider}`, `inset 0 0 0 1px ${C.bone}`, 260);
+      else if (was[4] && !now[4]) settle(li, `inset 0 0 0 1px ${C.bone}`, `inset 0 0 0 1px ${C.divider}`, 700);
+    }
     // the dot of the card being generated breathes
     const wl = workingIdx >= 0 ? items[workingIdx] : null;
     if (pulseAnim && pulseAnim.li !== wl) { pulseAnim.cancel(); pulseAnim = null; }
@@ -994,18 +1022,34 @@
   }
 
   // ---------- panel open, close, tabs, menu ----------
+  // the panel grows out of the launcher, and goes back into it quicker
+  let panelExit = null;
   function openPanel(which) {
+    const was = tab, opening = panel.style.display === 'none' || !!panelExit;
     if (which) tab = which;
     if (sel.on && !sel.busy) setSelect(false);  // one thing at a time: the panel or chat selection
+    if (panelExit) { panelExit.cancel(); panelExit = null; }
     panel.style.display = 'flex';
+    panel.style.pointerEvents = '';
     shownIdx = -1;
     render();
+    if (opening) enter(panel, { y: 10, scale: 0.97, ms: 200, origin: 'bottom right' });
+    else if (tab !== was) enter(body, { y: 0, ms: 140 });  // a tab switch: the new view fades in where the old one was
     if (tab === 'library') libSearch.focus();
   }
-  function closePanel() { closeMenu(); panel.style.display = 'none'; render(); }
-  function togglePanel() { if (panel.style.display === 'none') openPanel(); else closePanel(); }
+  function closePanel() {
+    closeMenu();
+    if (panel.style.display === 'none' || panelExit) return;
+    const done = () => { panelExit = null; panel.style.display = 'none'; render(); };
+    if (!panel.animate) return done();
+    panel.style.pointerEvents = 'none';
+    panelExit = panel.animate(calm() ? [{ opacity: 1 }, { opacity: 0 }] : [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateY(6px) scale(.98)' }], { duration: calm() ? 90 : 120, easing: LEAVE, fill: 'forwards' });
+    panelExit.onfinish = () => { panelExit.cancel(); done(); };
+    toggle.setAttribute('aria-expanded', 'false');
+  }
+  function togglePanel() { if (panel.style.display === 'none' || panelExit) openPanel(); else closePanel(); }  // pressed again while closing: it comes back
   function startOrPause() { bRun.onclick(); }
-  function openMenu() { menu.style.display = 'flex'; bMore.setAttribute('aria-expanded', 'true'); const f = [...menu.children].find((b) => !b.disabled); if (f) f.focus(); }
+  function openMenu() { menu.style.display = 'flex'; enter(menu, { y: 4, scale: 0.98, ms: 140, origin: 'bottom right' }); bMore.setAttribute('aria-expanded', 'true'); const f = [...menu.children].find((b) => !b.disabled); if (f) f.focus(); }
   function closeMenu() { if (menu.style.display === 'none') return; menu.style.display = 'none'; bMore.setAttribute('aria-expanded', 'false'); }
 
   toggle.onclick = togglePanel;
@@ -1088,7 +1132,14 @@
   });
   bNewSnip.onclick = () => openSnipForm(-1);
   bSnipCancel.onclick = () => { libForm.style.display = 'none'; snipMedia = []; renderLibrary(); };
-  const addPics = (list) => { const f = [...(list || [])].filter(isPicture); if (!f.length) return false; snipMedia.push(...f.map((file) => ({ file }))); renderSnipPics(); return true; };
+  const addPics = (list) => {
+    const f = [...(list || [])].filter(isPicture);
+    if (!f.length) return false;
+    snipMedia.push(...f.map((file) => ({ file }))); renderSnipPics();
+    const shown = snipPics.firstChild ? [...snipPics.firstChild.children] : [];
+    shown.slice(-f.length).forEach((t, k) => enter(t, { y: 0, scale: 0.85, ms: 200, delay: Math.min(k, 5) * 40 }));
+    return true;
+  };
   bAddPics.onclick = () => picInput.click();
   picInput.onchange = () => { addPics(picInput.files); picInput.value = ''; };
   libForm.addEventListener('paste', (e) => { if (e.clipboardData && addPics(e.clipboardData.files)) e.preventDefault(); });
@@ -1105,6 +1156,8 @@
     saveLibrary(); libForm.style.display = 'none'; snipMedia = []; sweepMedia();
     libSay(snipEditing >= 0 ? `Saved changes to "${s.name}".` : `Saved "${s.name}".`);
     renderLibrary();
+    const savedCard = libList.children[snipEditing >= 0 ? snipEditing : 0];
+    if (savedCard && !libSearch.value.trim()) { savedCard.scrollIntoView({ block: 'nearest' }); settle(savedCard, `inset 0 0 0 1px ${C.bone}`, `inset 0 0 0 1px ${C.divider}`, 900); }
   };
 
   // ---------- the last prompt: remembered on every send, sent again or put back in the chat box ----------
@@ -1112,7 +1165,7 @@
     last = { text, media: ids, at: Date.now() };
     GM_setValue('last', last);
     sweepMedia();
-    if (panel.style.display !== 'none' && tab === 'library') renderLast();
+    if (panel.style.display !== 'none' && tab === 'library') { renderLast(); settle(lastBox, `inset 0 0 0 1px ${C.bone}`, `inset 0 0 0 1px ${C.border}`, 900); }
   }
   async function repeatLast(send) {
     const tell = (t) => { if (panel.style.display === 'none') openPanel('library'); libSay(t); };
@@ -1208,7 +1261,8 @@
     say('');
     if (!on) { sel.ids.clear(); sel.last = null; watcher.disconnect(); }
     else { watcher.observe(document.body, { childList: true, subtree: true }); if (panel.style.display !== 'none') closePanel(); }
-    bar.style.display = on ? 'flex' : 'none';
+    if (on && bar.style.display === 'none') { bar.style.display = 'flex'; enter(bar, { y: -8, ms: 200 }); }
+    else bar.style.display = on ? 'flex' : 'none';
     document.querySelectorAll(SEL.chat).forEach(paintLink);
     renderBar(); render();
     if (on) {
