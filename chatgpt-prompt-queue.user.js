@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.5.5
+// @version      3.5.6
 // @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -1405,8 +1405,10 @@
   bDelete.onclick = () => batch('delete');
 
   // ---------- keyboard shortcuts ----------
-  // Alt plus a letter, matched by key position so it also works where Alt types accented letters
-  document.addEventListener('keydown', (e) => {
+  // Alt plus a letter, matched by key position so it also works where Alt types accented letters.
+  // Heard on the window, before the page: ChatGPT types any letter pressed outside a field into its chat box, Alt or
+  // not, so a shortcut caught later still left its letter in the prompt.
+  window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if (menu.style.display !== 'none') { e.stopPropagation(); closeMenu(); bMore.focus(); return; }
       if (sel.on && !sel.busy) { setSelect(false); return; }
