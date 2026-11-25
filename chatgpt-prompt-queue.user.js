@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.5.6
+// @version      3.5.7
 // @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -194,9 +194,18 @@
     const used = new Set([...library.flatMap((x) => x.media || []), ...(last ? last.media : []), ...state.queue.flatMap(qMedia)]);
     try { for (const k of await media.keys()) if (!used.has(k)) await media.del(k); } catch (_) { /* storage blocked: nothing to tidy */ }
   }
-  // the pictures waiting in the chat box: ChatGPT shows each as a small preview inside the composer
+  // the pictures waiting in the chat box. ChatGPT shows each at once as a chip with a Remove button, with a progress bar
+  // on it while it uploads; its small preview picture only comes once the upload is over, seconds later. Counting
+  // previews alone took a slow upload for a failed one, so the picture was attached a second time.
   const composer = (box) => (box && (box.closest('form') || box.parentElement?.parentElement)) || null;
-  const attachedCount = (box) => { const f = composer(box); return f ? [...f.querySelectorAll('img')].filter((i) => !ours(i)).length : 0; };
+  const attachedCount = (box) => {
+    const f = composer(box);
+    if (!f) return 0;
+    const chips = [...f.querySelectorAll('button[aria-label^="Remove"]')].filter((b) => !ours(b)).length;
+    const previews = [...f.querySelectorAll('img')].filter((i) => !ours(i)).length;
+    return Math.max(chips, previews);
+  };
+  const uploading = () => { const f = composer(findInput()); return !!f && [...f.querySelectorAll('[role="progressbar"]')].some((e) => !ours(e)); };
 
   // Attach pictures the way you would. Ways are tried in turn until ChatGPT shows them in the chat box:
   // 1. its own file picker, with files made by the page itself. In Firefox, Tampermonkey runs scripts in a sandbox, and
@@ -228,14 +237,15 @@
     for (const way of ways) {
       try { way(); } catch (e) { why = e && e.message ? e.message : String(e); continue; }
       if (await waitFor(() => attachedCount(box) >= want, 4000)) return '';
-      if (attachedCount(box) > want - files.length) break;  // some went in: stop, rather than attach them twice
+      // some went in: stop, rather than attach them twice, and give the rest a little longer
+      if (attachedCount(box) > want - files.length) return (await waitFor(() => attachedCount(box) >= want, 6000)) ? '' : 'Only some of the pictures went in. Attach the rest by hand.';
     }
     return `Couldn't attach the pictures${why ? ` (${why})` : ''}. Attach them by hand, or open More → Check page.`;
   }
 
   // Pictures upload after they're attached, and ChatGPT redraws its chat box when they're done, which can wipe text
-  // typed in the meantime. Its Send button stays off until the upload is over, so wait for that first.
-  const uploadsDone = () => waitFor(() => { const b = findSend(); return !!b && !b.disabled; }, 90000);
+  // typed in the meantime. So wait until no picture shows its progress bar, and the Send button is on.
+  const uploadsDone = () => waitFor(() => { const b = findSend(); return !uploading() && !!b && !b.disabled; }, 90000);
 
   // Put text in the chat box and make sure it's there. Attaching pictures makes ChatGPT redraw its chat box, and the
   // redraw can replace the editor: text typed into the one found before would go nowhere while looking fine. So the box
@@ -1041,7 +1051,14 @@
     renderLibrary();
     snipName.focus();
   }
+  // one Insert or Put in chat box at a time: a second click while pictures upload would attach them again
+  let filling = false;
   async function insertIntoChat(text, ids = []) {
+    if (filling) return libSay('Still putting the last one in. A moment…');
+    filling = true;
+    try { await insertNow(text, ids); } finally { filling = false; }
+  }
+  async function insertNow(text, ids) {
     const box = findInput();
     if (!box) return libSay("Couldn't find the chat box.");
     if (ids.length) libSay('Attaching the pictures…');
@@ -1214,9 +1231,11 @@
     const tell = (t) => { if (panel.style.display === 'none') openPanel('library'); libSay(t); };
     if (!last) return tell('Nothing sent yet. Send a prompt, and it shows up here.');
     if (state.running) return tell('The queue is running. Pause it first.');
+    if (filling) return tell('Still putting the last one in. A moment…');
     if (panel.style.display !== 'none') libSay(send ? 'Sending it again…' : 'Putting it in the chat box…');
     let err;
-    try { err = await sendPrompt(last.text, last.media, !send); } catch (e) { err = `Something went wrong: ${e && e.message ? e.message : e}`; }
+    filling = true;
+    try { err = await sendPrompt(last.text, last.media, !send); } catch (e) { err = `Something went wrong: ${e && e.message ? e.message : e}`; } finally { filling = false; }
     if (err) return tell(err);
     if (send) { updateDaily((d) => { d.sent++; }); setLast(last.text, last.media); libSay('Sent again.'); }
     else { findInput()?.focus(); if (panel.style.display !== 'none') libSay('In the chat box. Change it if you like, then send.'); }
