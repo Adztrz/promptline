@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.5.4
+// @version      3.5.5
 // @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -233,13 +233,36 @@
     return `Couldn't attach the pictures${why ? ` (${why})` : ''}. Attach them by hand, or open More → Check page.`;
   }
 
+  // Pictures upload after they're attached, and ChatGPT redraws its chat box when they're done, which can wipe text
+  // typed in the meantime. Its Send button stays off until the upload is over, so wait for that first.
+  const uploadsDone = () => waitFor(() => { const b = findSend(); return !!b && !b.disabled; }, 90000);
+
+  // Put text in the chat box and make sure it's there. Attaching pictures makes ChatGPT redraw its chat box, and the
+  // redraw can replace the editor: text typed into the one found before would go nowhere while looking fine. So the box
+  // is found again each time, and the check is made on the one on the page now, a moment later.
+  async function putText(text, keep = false) {
+    const want = text.slice(0, 40);
+    for (let tryNo = 0; tryNo < 3; tryNo++) {
+      const box = await waitFor(findInput, 5000);
+      if (!box) return false;
+      const cur = keep ? boxText(box) : '';
+      await fill(box, cur && !cur.includes(want) ? `${cur} ${text}` : text);
+      await sleep(500);
+      const live = findInput();
+      if (live && boxText(live).includes(want)) return true;
+    }
+    return false;
+  }
+
   // Returns '' when sent, or what went wrong. Pictures go in first, then the text.
   async function sendPrompt(text, ids = [], dontSend = false) {
-    const box = await waitFor(findInput, 15000);
+    let box = await waitFor(findInput, 15000);
     if (!box) return "Couldn't find the chat box.";
     const bad = await attach(box, ids);
     if (bad) return bad;
-    if (!(await fill(box, text))) return "Found the chat box, but the text didn't go in.";
+    if (ids.length) { await uploadsDone(); await sleep(300); }
+    if (text && !(await putText(text))) return "Found the chat box, but the text didn't go in.";
+    box = findInput() || box;
     if (dontSend) return '';
     // the send button stays off while pictures upload
     const btn = await waitFor(() => { const b = findSend(); return b && !b.disabled ? b : null; }, ids.length ? 90000 : 10000);
@@ -1025,11 +1048,11 @@
     let bad;
     try { bad = await attach(box, ids); } catch (e) { bad = `Something went wrong: ${e && e.message ? e.message : e}`; }
     if (bad) return libSay(bad);
-    if (!text) { box.focus(); return libSay(`Attached ${plural(ids.length, 'picture')}.`); }
-    const cur = boxText(box);
-    if (await fill(box, cur ? `${cur} ${text}` : text)) libSay(ids.length ? `Inserted, with ${plural(ids.length, 'picture')}.` : 'Inserted into the chat box.');
+    if (ids.length) { libSay('Waiting for the pictures to upload…'); await uploadsDone(); await sleep(300); }
+    if (!text) { (findInput() || box).focus(); return libSay(`Attached ${plural(ids.length, 'picture')}.`); }
+    if (await putText(text, true)) libSay(ids.length ? `Inserted, with ${plural(ids.length, 'picture')}.` : 'Inserted into the chat box.');
     else libSay("Found the chat box, but the text didn't go in.");
-    box.focus();
+    (findInput() || box).focus();
   }
   function addToQueue(text, ids = []) {
     const l = text ? parse(text) : [''];
