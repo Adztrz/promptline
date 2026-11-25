@@ -2,8 +2,8 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.3.2
-// @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, and keep a prompt library.
+// @version      3.4.0
+// @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @grant        GM_getValue
@@ -86,8 +86,15 @@
 
   const settings = { download: true, png: true, prefix: '', autoResume: true, notify: true, ...GM_getValue('settings', {}) };
   const saveSettings = () => GM_setValue('settings', settings);
-  let library = GM_getValue('library', []);  // [{ name, text }]
+  let library = GM_getValue('library', []);  // [{ name, text, media?: [ids] }]
   const saveLibrary = () => GM_setValue('library', library);
+  // the last prompt sent, by you or by the queue, with its pictures: { text, media: [ids], at }
+  let last = GM_getValue('last', null);
+
+  // A queued prompt is its text, or { t: text, m: [media ids] } when pictures go with it.
+  const qText = (q) => (typeof q === 'string' ? q : q.t);
+  const qMedia = (q) => (typeof q === 'string' ? [] : q.m || []);
+  const qItem = (t, m) => (m && m.length ? { t, m } : t);
 
   // One prompt per line; "1. " or "1) " numbering is removed.
   const parse = (text) => text.split('\n').map((l) => l.replace(/^\s*\d+[.)]\s+/, '').trim()).filter(Boolean);
@@ -162,12 +169,61 @@
     await sleep(300); return landed();
   }
 
-  // Returns '' when sent, or what went wrong.
-  async function sendPrompt(text) {
+  // ---------- pictures: kept with a saved prompt or the last prompt ----------
+  // Tampermonkey's storage holds text, so the pictures themselves live in this site's IndexedDB, as Blobs keyed by id.
+  const media = (() => {
+    let dbp = null;
+    const db = () => dbp || (dbp = new Promise((ok, no) => {
+      const r = indexedDB.open('promptline', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('media');
+      r.onsuccess = () => ok(r.result); r.onerror = () => { dbp = null; no(r.error); };
+    }));
+    const run = async (mode, fn) => { const d = await db(); return new Promise((ok, no) => { const t = d.transaction('media', mode), r = fn(t.objectStore('media')); t.oncomplete = () => ok(r && r.result); t.onerror = () => no(t.error); }); };
+    return {
+      put: async (file) => { const id = `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`; await run('readwrite', (st) => st.put({ blob: file, name: file.name || 'picture.png', type: file.type || 'image/png' }, id)); return id; },
+      get: (id) => run('readonly', (st) => st.get(id)),
+      del: (id) => run('readwrite', (st) => st.delete(id)),
+      keys: () => run('readonly', (st) => st.getAllKeys()),
+    };
+  })();
+  const isPicture = (f) => /^image\//.test(f.type || '');
+  const filesOf = async (ids) => { const out = []; for (const id of ids) { const m = await media.get(id).catch(() => null); if (m) out.push(new File([m.blob], m.name, { type: m.type })); } return out; };
+  // pictures nothing points at any more (a deleted template, an old last prompt) are removed
+  async function sweepMedia() {
+    const used = new Set([...library.flatMap((x) => x.media || []), ...(last ? last.media : []), ...state.queue.flatMap(qMedia)]);
+    try { for (const k of await media.keys()) if (!used.has(k)) await media.del(k); } catch (_) { /* storage blocked: nothing to tidy */ }
+  }
+  // the pictures waiting in the chat box: ChatGPT shows each as a small preview inside the composer
+  const composer = (box) => (box && (box.closest('form') || box.parentElement?.parentElement)) || null;
+  const attachedCount = (box) => { const f = composer(box); return f ? [...f.querySelectorAll('img')].filter((i) => !ours(i)).length : 0; };
+
+  // Attach pictures the way you would: through ChatGPT's own file picker, or by pasting them if that doesn't take.
+  // Returns '' when they're in, or what went wrong.
+  async function attach(box, ids) {
+    if (!ids.length) return '';
+    const files = await filesOf(ids);
+    if (!files.length) return 'The pictures saved with this prompt are gone.';
+    const before = attachedCount(box), want = before + files.length;
+    const pack = () => { const dt = new DataTransfer(); files.forEach((f) => dt.items.add(f)); return dt; };
+    const input = [...document.querySelectorAll('input[type="file"]')].find((i) => !ours(i) && (!i.accept || /image|\*/.test(i.accept)));
+    if (input) { input.files = pack().files; input.dispatchEvent(new Event('change', { bubbles: true })); }
+    if (input && (await waitFor(() => attachedCount(box) >= want, 6000))) return '';
+    box.focus();
+    box.dispatchEvent(new ClipboardEvent('paste', { clipboardData: pack(), bubbles: true, cancelable: true }));
+    if (await waitFor(() => attachedCount(box) >= want, 6000)) return '';
+    return "Couldn't attach the pictures. Attach them by hand, or open More → Check page.";
+  }
+
+  // Returns '' when sent, or what went wrong. Pictures go in first, then the text.
+  async function sendPrompt(text, ids = [], dontSend = false) {
     const box = await waitFor(findInput, 15000);
     if (!box) return "Couldn't find the chat box.";
+    const bad = await attach(box, ids);
+    if (bad) return bad;
     if (!(await fill(box, text))) return "Found the chat box, but the text didn't go in.";
-    const btn = await waitFor(() => { const b = findSend(); return b && !b.disabled ? b : null; }, 10000);
+    if (dontSend) return '';
+    // the send button stays off while pictures upload
+    const btn = await waitFor(() => { const b = findSend(); return b && !b.disabled ? b : null; }, ids.length ? 90000 : 10000);
     if (btn) { btn.click(); return ''; }
     // no button found: press Enter in the box instead
     box.focus();
@@ -179,7 +235,7 @@
   // ---------- downloads ----------
   const slug = (t) => t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').split('-').slice(0, 6).join('-').slice(0, 40);
   // the extension is set when saving, from what the file really is
-  const fileName = (i, k) => `${settings.prefix.replace(/[\\/:*?"<>|]+/g, '-')}${String(i + 1).padStart(3, '0')}-${slug(state.queue[i] || '') || 'image'}${k ? `-${k + 1}` : ''}`;
+  const fileName = (i, k) => `${settings.prefix.replace(/[\\/:*?"<>|]+/g, '-')}${String(i + 1).padStart(3, '0')}-${slug(qText(state.queue[i] || '')) || 'image'}${k ? `-${k + 1}` : ''}`;
   const EXT = { 'image/png': 'png', 'image/webp': 'webp', 'image/jpeg': 'jpg' };
 
   // Redraw an image as PNG. ChatGPT stores its images as WebP; the PNG has the same pixels, in a bigger file.
@@ -278,8 +334,10 @@
       if (!state.running) return;
 
       const before = turnCount();
-      const err = await sendPrompt(state.queue[state.idx]);
+      const q = state.queue[state.idx];
+      const err = await sendPrompt(qText(q), qMedia(q));
       if (err) return pause(`${err} Open More → Check page to see what the script can find.`);
+      setLast(qText(q), qMedia(q));
       state.idx++; save(); render();
       updateDaily((d) => { d.sent++; });
       setStatus(`Sent ${state.idx} of ${state.queue.length}. Waiting for the reply…`);
@@ -586,6 +644,9 @@
   // library: saved prompts to insert into the chat box or add to the queue
   const libView = el('div', { flex: '1', minHeight: '0', display: 'flex', flexDirection: 'column' });
   libView.id = 'pl-view-library'; libView.setAttribute('role', 'tabpanel'); libView.setAttribute('aria-labelledby', 'pl-tab-library');
+  // the last prompt sent, ready to go again
+  const lastBox = el('div', { display: 'none', flexDirection: 'column', gap: '8px', padding: '12px 14px', marginBottom: '12px', borderRadius: '8px', background: C.raised, boxShadow: `inset 0 0 0 1px ${C.border}`, flex: 'none' });
+  lastBox.setAttribute('aria-label', 'Last prompt sent');
   const libTop = el('div', { display: 'flex', gap: '8px', marginBottom: '10px', flex: 'none' });
   const libSearch = field('input', 'Search saved prompts', 'Search saved prompts; Enter inserts the first match', { flex: '1' });
   const bNewSnip = button('New');
@@ -593,16 +654,23 @@
   const libForm = el('div', { display: 'none', flexDirection: 'column', gap: '8px', padding: '12px', borderRadius: '8px', boxShadow: `inset 0 0 0 1px ${C.rule}`, marginBottom: '10px', flex: 'none' });
   const snipName = field('input', 'Name, e.g. Realistic landscape style', 'Name');
   const snipText = field('textarea', 'The prompt text. Several lines become several queue prompts.', 'Prompt text', { height: '90px', resize: 'vertical' });
-  const libFormRow = el('div', { display: 'flex', gap: '8px', justifyContent: 'flex-end' });
+  // pictures that go with the prompt: added from a file, pasted, or dropped on the form
+  const snipPics = el('div', { display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' });
+  const picInput = el('input', { display: 'none' });
+  picInput.type = 'file'; picInput.accept = 'image/*'; picInput.multiple = true;
+  const bAddPics = button('Add pictures', 'ghost');
+  bAddPics.title = 'Pictures to attach with this prompt; you can also paste or drop them here';
+  const libFormRow = el('div', { display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' });
   const bSnipCancel = button('Cancel', 'ghost');
   const bSnipSave = button('Save', 'primary');
-  libFormRow.append(bSnipCancel, bSnipSave);
-  libForm.append(snipName, snipText, libFormRow);
+  libFormRow.append(bAddPics, picInput, el('span', { flex: '1' }), bSnipCancel, bSnipSave);
+  libForm.append(snipName, snipText, snipPics, libFormRow);
   const libList = el('ol', { listStyle: 'none', margin: '0 -4px 0 0', padding: '0 4px 0 0', display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto', minHeight: '0', flex: '1' });
   const libNote = el('div', { marginTop: '10px', minHeight: '18px', fontSize: '12px', color: C.muted, flex: 'none' });
   libNote.setAttribute('aria-live', 'polite');
-  libView.append(libTop, libForm, libList, libNote);
+  libView.append(lastBox, libTop, libForm, libList, libNote);
   let snipEditing = -1;
+  let snipMedia = [];  // the form's pictures: { id } already saved, or { file } just added
 
   // settings
   const setView = el('div', { flex: '1', minHeight: '0', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '14px', paddingRight: '4px' });
@@ -636,7 +704,7 @@
   testRow.append(bTestNote);
   const keysHead = el('div', { color: C.strong, marginTop: '4px' }, 'Keyboard shortcuts');
   const keys = el('div', { display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '8px 12px', alignItems: 'center', fontSize: '12px', color: C.text });
-  for (const [k, what] of [[['Alt', 'Q'], 'Open or close this panel'], [['Alt', 'S'], 'Start or pause the queue'], [['Alt', 'X'], 'Select chats in the sidebar'], [['Alt', 'L'], 'Prompt library'], [['Esc'], 'Close a menu, leave selection, or close the panel']]) {
+  for (const [k, what] of [[['Alt', 'Q'], 'Open or close this panel'], [['Alt', 'S'], 'Start or pause the queue'], [['Alt', 'X'], 'Select chats in the sidebar'], [['Alt', 'L'], 'Prompt library'], [['Alt', 'R'], 'Put your last prompt, with its pictures, back in the chat box'], [['Esc'], 'Close a menu, leave selection, or close the panel']]) {
     const combo = el('span', { display: 'inline-flex', gap: '4px', alignItems: 'center' });
     k.forEach((x, i) => { if (i) combo.append(el('span', { color: C.faint, fontSize: '11px' }, '+')); combo.append(kbd(x)); });
     keys.append(combo, el('span', {}, what));
@@ -704,7 +772,8 @@
   }
 
   // The card being generated is the loudest; the next one is quiet but numbered brightly.
-  function card(text, i) {
+  function card(q, i) {
+    const text = qText(q), pics = qMedia(q).length;
     const sent = i < state.idx, next = i === state.idx, working = state.running && !state.waitUntil && i === state.idx - 1;
     const li = el('li', {
       display: 'grid', gridTemplateColumns: '28px 1fr', gap: '4px 10px', padding: '12px 14px', borderRadius: '8px',
@@ -718,6 +787,7 @@
       : tag('Queued', C.faint, C.faint);
     if (working) pulseAnim = pulse(label.dot);
     li.append(num, label, clampText(text, sent ? C.muted : C.text, 3));
+    if (pics) li.append(el('span'), el('span', { font: `500 11px/1.4 ${MONO}`, color: C.faint }, `+ ${plural(pics, 'picture')}`));
     return li;
   }
   // long text folds to a few lines; it opens by click or by keyboard
@@ -795,7 +865,55 @@
     if (tab === 'library') renderLibrary();
   }
 
+  // small previews of saved pictures, made once per picture
+  const thumbURL = new Map();
+  async function thumbSrc(x) {
+    if (x.file) return x.url || (x.url = URL.createObjectURL(x.file));
+    if (!thumbURL.has(x.id)) { const m = await media.get(x.id).catch(() => null); thumbURL.set(x.id, m ? URL.createObjectURL(m.blob) : ''); }
+    return thumbURL.get(x.id);
+  }
+  function thumbRow(items, onRemove) {
+    const row = el('div', { display: 'flex', flexWrap: 'wrap', gap: '6px' });
+    items.forEach((x, k) => {
+      const it = typeof x === 'string' ? { id: x } : x;
+      const t = el('span', { position: 'relative', width: '44px', height: '44px', borderRadius: '6px', overflow: 'hidden', background: C.canvas, boxShadow: `inset 0 0 0 1px ${C.border}`, flex: 'none' });
+      const img = el('img', { width: '100%', height: '100%', objectFit: 'cover', display: 'block' });
+      img.alt = '';
+      thumbSrc(it).then((u) => { if (u) img.src = u; else t.title = 'This picture is gone'; });
+      t.append(img);
+      if (onRemove) {
+        const x = el('button', { position: 'absolute', top: '2px', right: '2px', width: '18px', height: '18px', padding: '0', border: '0', borderRadius: '50%', background: 'rgba(7,9,11,.8)', color: C.strong, cursor: 'pointer', display: 'grid', placeItems: 'center' });
+        x.type = 'button'; x.setAttribute('aria-label', `Remove picture ${k + 1}`); x.title = 'Remove';
+        x.append(icon(['M7 7l10 10', 'M17 7L7 17'], 12, 'currentColor', 2.4));
+        x.onclick = () => onRemove(k);
+        t.append(x);
+      }
+      row.append(t);
+    });
+    return row;
+  }
+  function renderLast() {
+    lastBox.style.display = last ? 'flex' : 'none';
+    if (!last) return;
+    const head = el('div', { display: 'flex', alignItems: 'center', gap: '8px' });
+    head.append(tag('Last sent', C.positive, C.text), el('span', { flex: '1' }), el('span', { font: `500 11px/1 ${MONO}`, color: C.faint }, clock(last.at)));
+    const bAgain = button('Send again'), bPut = button('Put in chat box', 'ghost'), bKeep = button('Save as template', 'ghost');
+    bAgain.title = 'Send it again now, with its pictures';
+    bPut.title = 'Put it in the chat box to change before sending (Alt+R)';
+    bAgain.disabled = state.running; dim(bAgain);
+    bAgain.onclick = () => repeatLast(true);
+    bPut.onclick = () => repeatLast(false);
+    bKeep.onclick = () => openSnipForm(-1, { name: '', text: last.text, media: last.media });
+    const acts = el('div', { display: 'flex', gap: '6px', flexWrap: 'wrap', margin: '2px -8px -4px 0' });
+    acts.append(bAgain, bPut, el('span', { flex: '1' }), bKeep);
+    lastBox.replaceChildren(head, clampText(last.text || 'Pictures only', last.text ? C.text : C.muted, 2), ...(last.media.length ? [thumbRow(last.media)] : []), acts);
+  }
+  function renderSnipPics() {
+    snipPics.replaceChildren(...(snipMedia.length ? [thumbRow(snipMedia, (k) => { snipMedia.splice(k, 1); renderSnipPics(); })] : []));
+    snipPics.style.display = snipMedia.length ? 'flex' : 'none';
+  }
   function renderLibrary() {
+    renderLast();
     const q = libSearch.value.trim().toLowerCase();
     const shown = library.map((s, i) => [s, i]).filter(([s]) => !q || `${s.name} ${s.text}`.toLowerCase().includes(q));
     libList.replaceChildren(...shown.map(([s, i]) => {
@@ -803,16 +921,18 @@
       const lines = parse(s.text).length;
       const head = el('div', { display: 'flex', alignItems: 'baseline', gap: '8px' });
       head.append(el('span', { color: C.strong, fontWeight: '500', flex: '1', overflowWrap: 'anywhere' }, s.name));
-      if (lines > 1) head.append(el('span', { font: `500 11px/1 ${MONO}`, color: C.faint }, `${lines} prompts`));
+      const pics = (s.media || []).length;
+      if (lines > 1 || pics) head.append(el('span', { font: `500 11px/1 ${MONO}`, color: C.faint }, [lines > 1 && `${lines} prompts`, pics && plural(pics, 'picture')].filter(Boolean).join(' · ')));
       const acts = el('div', { display: 'flex', gap: '4px', flexWrap: 'wrap', margin: '2px -8px -4px' });
       const bIns = button('Insert', 'ghost'), bQ = button('Add to queue', 'ghost'), bEd = button('Edit', 'ghost'), bDel = button('Delete…', 'ghost');
-      bIns.title = 'Put it in the chat box';
-      bIns.onclick = () => insertIntoChat(s.text);
-      bQ.onclick = () => addToQueue(s.text);
+      bIns.title = pics ? 'Put it in the chat box, with its pictures attached' : 'Put it in the chat box';
+      bQ.title = pics ? 'Queue each line, each with these pictures attached' : 'Queue each line';
+      bIns.onclick = () => insertIntoChat(s.text, s.media || []);
+      bQ.onclick = () => addToQueue(s.text, s.media || []);
       bEd.onclick = () => openSnipForm(i);
-      bDel.onclick = () => { if (confirm(`Delete "${s.name}" from the library? This can't be undone.`)) { library.splice(i, 1); saveLibrary(); renderLibrary(); } };
+      bDel.onclick = () => { if (confirm(`Delete "${s.name}" from the library? This can't be undone.`)) { library.splice(i, 1); saveLibrary(); renderLibrary(); sweepMedia(); } };
       acts.append(bIns, bQ, el('span', { flex: '1' }), bEd, bDel);
-      li.append(head, clampText(s.text, C.text, 2), acts);
+      li.append(head, ...(s.text ? [clampText(s.text, C.text, 2)] : []), ...(pics ? [thumbRow(s.media)] : []), acts);
       return li;
     }));
     const formOpen = libForm.style.display !== 'none';
@@ -822,27 +942,35 @@
     else if (!libNote.dataset.keep) libNote.textContent = '';
   }
   function libSay(t) { libNote.textContent = t; libNote.dataset.keep = '1'; setTimeout(() => { delete libNote.dataset.keep; }, 4000); }
-  function openSnipForm(i) {
+  function openSnipForm(i, preset) {
     snipEditing = i;
-    snipName.value = i >= 0 ? library[i].name : '';
-    snipText.value = i >= 0 ? library[i].text : '';
+    const from = preset || (i >= 0 ? library[i] : { name: '', text: '', media: [] });
+    snipName.value = from.name || '';
+    snipText.value = from.text || '';
+    snipMedia = (from.media || []).map((id) => ({ id }));
+    renderSnipPics();
+    if (preset && tab !== 'library') openPanel('library');
     libForm.style.display = 'flex';
     renderLibrary();
     snipName.focus();
   }
-  async function insertIntoChat(text) {
+  async function insertIntoChat(text, ids = []) {
     const box = findInput();
     if (!box) return libSay("Couldn't find the chat box.");
+    if (ids.length) libSay('Attaching the pictures…');
+    const bad = await attach(box, ids);
+    if (bad) return libSay(bad);
+    if (!text) { box.focus(); return libSay(`Attached ${plural(ids.length, 'picture')}.`); }
     const cur = boxText(box);
-    if (await fill(box, cur ? `${cur} ${text}` : text)) libSay('Inserted into the chat box.');
+    if (await fill(box, cur ? `${cur} ${text}` : text)) libSay(ids.length ? `Inserted, with ${plural(ids.length, 'picture')}.` : 'Inserted into the chat box.');
     else libSay("Found the chat box, but the text didn't go in.");
     box.focus();
   }
-  function addToQueue(text) {
-    const l = parse(text);
+  function addToQueue(text, ids = []) {
+    const l = text ? parse(text) : [''];
     const fresh = !state.queue.length || state.idx >= state.queue.length;
     if (fresh) { state.queue = []; state.idx = 0; state.got = []; state.note = ''; }
-    state.queue.push(...l); save();
+    state.queue.push(...l.map((t) => qItem(t, ids))); save();
     editing = false;
     libSay(fresh ? `Started a new queue with ${plural(l.length, 'prompt')}.` : `Added ${plural(l.length, 'prompt')} to the end of the queue (now ${state.queue.length}).`);
     render();
@@ -885,12 +1013,19 @@
   bLoad.onclick = () => {
     const l = parse(area.value);
     if (!l.length) return;
-    state.queue = l; state.idx = 0; state.got = []; state.note = ''; save();
+    state.queue = l.map((t) => qItem(t, editPics.get(t))); editPics = new Map(); state.idx = 0; state.got = []; state.note = ''; save();
     editing = false; undoStrip.style.display = 'none'; render();
     setStatus(`Loaded ${plural(l.length, 'prompt')}. Press Start.`);
   };
   bCancel.onclick = () => { editing = false; render(); };
-  mEdit.onclick = () => { closeMenu(); if (state.running) return; area.value = state.queue.slice(state.idx).join('\n'); editing = true; render(); area.focus(); };
+  // pictures stay with a line as long as its text is unchanged
+  let editPics = new Map();
+  mEdit.onclick = () => {
+    closeMenu(); if (state.running) return;
+    const rest = state.queue.slice(state.idx);
+    editPics = new Map(rest.filter((q) => qMedia(q).length).map((q) => [qText(q), qMedia(q)]));
+    area.value = rest.map(qText).join('\n'); editing = true; render(); area.focus();
+  };
   bRun.onclick = () => {
     if (state.running) return pause('Paused. Press Resume to continue from the next prompt.', false);
     if (state.idx >= state.queue.length) return;
@@ -935,16 +1070,70 @@
     if (hit) insertIntoChat(hit.text);
   });
   bNewSnip.onclick = () => openSnipForm(-1);
-  bSnipCancel.onclick = () => { libForm.style.display = 'none'; renderLibrary(); };
-  bSnipSave.onclick = () => {
+  bSnipCancel.onclick = () => { libForm.style.display = 'none'; snipMedia = []; renderLibrary(); };
+  const addPics = (list) => { const f = [...(list || [])].filter(isPicture); if (!f.length) return false; snipMedia.push(...f.map((file) => ({ file }))); renderSnipPics(); return true; };
+  bAddPics.onclick = () => picInput.click();
+  picInput.onchange = () => { addPics(picInput.files); picInput.value = ''; };
+  libForm.addEventListener('paste', (e) => { if (e.clipboardData && addPics(e.clipboardData.files)) e.preventDefault(); });
+  libForm.addEventListener('dragover', (e) => { if ([...(e.dataTransfer?.items || [])].some((x) => x.kind === 'file')) e.preventDefault(); });
+  libForm.addEventListener('drop', (e) => { if (addPics(e.dataTransfer?.files)) e.preventDefault(); });
+  bSnipSave.onclick = async () => {
     const name = snipName.value.trim(), text = snipText.value.trim();
-    if (!text) return snipText.focus();
-    const s = { name: name || text.split('\n')[0].slice(0, 40), text };
+    if (!text && !snipMedia.length) return snipText.focus();
+    let ids;
+    try { ids = []; for (const x of snipMedia) ids.push(x.id || (await media.put(x.file))); }
+    catch (_) { return libSay("Couldn't store the pictures in this browser. Saved prompts with pictures need site storage allowed for chatgpt.com."); }
+    const s = { name: name || (text ? text.split('\n')[0].slice(0, 40) : `${plural(ids.length, 'picture')}`), text, ...(ids.length ? { media: ids } : {}) };
     if (snipEditing >= 0) library[snipEditing] = s; else library.unshift(s);
-    saveLibrary(); libForm.style.display = 'none';
+    saveLibrary(); libForm.style.display = 'none'; snipMedia = []; sweepMedia();
     libSay(snipEditing >= 0 ? `Saved changes to "${s.name}".` : `Saved "${s.name}".`);
     renderLibrary();
   };
+
+  // ---------- the last prompt: remembered on every send, sent again or put back in the chat box ----------
+  function setLast(text, ids) {
+    last = { text, media: ids, at: Date.now() };
+    GM_setValue('last', last);
+    sweepMedia();
+    if (panel.style.display !== 'none' && tab === 'library') renderLast();
+  }
+  async function repeatLast(send) {
+    const tell = (t) => { if (panel.style.display === 'none') openPanel('library'); libSay(t); };
+    if (!last) return tell('Nothing sent yet. Send a prompt, and it shows up here.');
+    if (state.running) return tell('The queue is running. Pause it first.');
+    if (panel.style.display !== 'none') libSay(send ? 'Sending it again…' : 'Putting it in the chat box…');
+    const err = await sendPrompt(last.text, last.media, !send);
+    if (err) return tell(err);
+    if (send) { updateDaily((d) => { d.sent++; }); setLast(last.text, last.media); libSay('Sent again.'); }
+    else { findInput()?.focus(); if (panel.style.display !== 'none') libSay('In the chat box. Change it if you like, then send.'); }
+  }
+  // Pictures you attach by hand (picker, paste or drop) are noted until you send; then the text and the pictures
+  // still in the chat box become the last prompt. Promptline's own attaching isn't a trusted event, so it isn't noted twice.
+  let picked = [];
+  const inChatBox = (t) => { const f = composer(findInput()); return !!(f && t && f.contains(t)); };
+  const notePictures = (list) => { const f = [...(list || [])].filter(isPicture); if (f.length) picked.push(...f); };
+  document.addEventListener('change', (e) => { const i = e.target; if (e.isTrusted && i && i.type === 'file' && !ours(i)) notePictures(i.files); }, true);
+  document.addEventListener('paste', (e) => { if (e.isTrusted && inChatBox(e.target)) notePictures(e.clipboardData && e.clipboardData.files); }, true);
+  document.addEventListener('drop', (e) => { if (e.isTrusted && inChatBox(e.target)) notePictures(e.dataTransfer && e.dataTransfer.files); }, true);
+  function noteSend() {
+    const box = findInput();
+    if (!box || state.running) return;
+    const text = boxText(box), shown = attachedCount(box);
+    const pics = shown ? picked.slice(-shown) : [];  // one removed before sending isn't kept
+    picked = [];
+    if (!text && !pics.length) return;
+    Promise.all(pics.map((f) => media.put(f))).then((ids) => setLast(text, ids), () => setLast(text, []));
+  }
+  document.addEventListener('click', (e) => {
+    if (!e.isTrusted || ours(e.target)) return;
+    const b = e.target.closest && e.target.closest(SEL.send.join(', '));
+    if (b && !b.disabled) noteSend();
+  }, true);
+  document.addEventListener('keydown', (e) => {
+    if (!e.isTrusted || e.key !== 'Enter' || e.shiftKey || e.isComposing || e.altKey || e.ctrlKey || e.metaKey) return;
+    const box = findInput();
+    if (box && box.contains(e.target)) noteSend();
+  }, true);
 
   // ---------- chat selection: tick chats in the sidebar, then archive or delete them together ----------
   const sel = { on: false, ids: new Set(), last: null, busy: false, stop: false };
@@ -1093,7 +1282,7 @@
       return;
     }
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
-    const act = { KeyQ: togglePanel, KeyS: startOrPause, KeyX: () => !sel.busy && setSelect(!sel.on), KeyL: () => openPanel('library') }[e.code];
+    const act = { KeyQ: togglePanel, KeyS: startOrPause, KeyX: () => !sel.busy && setSelect(!sel.on), KeyL: () => openPanel('library'), KeyR: () => repeatLast(false) }[e.code];
     if (!act) return;
     e.preventDefault(); e.stopPropagation();
     act();

@@ -33,6 +33,11 @@ Reload the page afterwards to refresh the sidebar. **Esc** or **Done** leaves se
 
 Under **Library** (or **Alt+L**), save prompts and style lines you reuse. **Insert** adds one to the chat box; **Add to queue** adds its lines as queue prompts. Type to search, and press **Enter** to insert the first match.
 
+- **Pictures with a prompt:** a saved prompt can keep pictures, such as a reference image or a style sheet. In the New or Edit form, press **Add pictures**, or paste or drop them onto the form. **Insert** then attaches them along with the text, and **Add to queue** sends every line with those pictures attached. The queue card shows how many go with each prompt.
+- **Last sent:** the top of the Library shows the last prompt you sent, by hand or from the queue, with the pictures that went with it. **Send again** sends it as it was; **Put in chat box** (or **Alt+R**) puts it back for you to change; **Save as template** keeps it in the Library.
+
+The pictures are kept in this browser's own storage for chatgpt.com (IndexedDB), not in Tampermonkey. Clearing chatgpt.com's site data removes them; the prompts' text stays.
+
 ## Notifications
 
 A desktop notification arrives when the queue finishes, pauses, or waits on a limit. Turn them off, or send a test one, under Settings.
@@ -45,4 +50,5 @@ A desktop notification arrives when the queue finishes, pauses, or waits on a li
 | Alt+S | Start or pause the queue |
 | Alt+X | Select chats in the sidebar |
 | Alt+L | Prompt library |
+| Alt+R | Put your last prompt, with its pictures, back in the chat box |
 | Esc | Leave chat selection |
