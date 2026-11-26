@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.5.8
+// @version      3.5.9
 // @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -462,7 +462,7 @@
       }
       /* fingers need bigger targets than a pointer: 44px controls on touch screens and in narrow windows */
       @media (pointer: coarse), (max-width: 520px) {
-        .pl-root button, .pl-root input:not([type="checkbox"]):not([type="file"]) { height: 44px !important; }
+        .pl-root button, button.pl-root, .pl-root input:not([type="checkbox"]):not([type="file"]) { height: 44px !important; }
         .pl-root .pl-icon { width: 44px !important; }
         .pl-root [role="menuitem"] { min-height: 44px !important; }
       }`;
