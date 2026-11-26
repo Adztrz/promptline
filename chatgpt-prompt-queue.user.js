@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.5.7
+// @version      3.5.8
 // @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -459,6 +459,12 @@
       @media (max-width: 520px) {
         .pl-panel { left: 8px !important; right: 8px !important; width: auto !important; max-width: none !important; }
         .pl-bar { top: 8px !important; }
+      }
+      /* fingers need bigger targets than a pointer: 44px controls on touch screens and in narrow windows */
+      @media (pointer: coarse), (max-width: 520px) {
+        .pl-root button, .pl-root input:not([type="checkbox"]):not([type="file"]) { height: 44px !important; }
+        .pl-root .pl-icon { width: 44px !important; }
+        .pl-root [role="menuitem"] { min-height: 44px !important; }
       }`;
   try { GM_addStyle(CSS); } catch (_) {
     try { const sheet = new CSSStyleSheet(); sheet.replaceSync(CSS); document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet]; }
@@ -514,6 +520,7 @@
   function iconButton(d, label, stroke = 1.8) {
     const b = button('', 'ghost');
     Object.assign(b.style, { width: H, padding: '0' });
+    b.classList.add('pl-icon');
     b.append(icon(d, 18, 'currentColor', stroke));
     b.setAttribute('aria-label', label); b.title = label;
     return b;
@@ -613,6 +620,14 @@
   }
   toggle.title = 'Promptline (Alt+E)';
   toggle.setAttribute('aria-label', 'Promptline (Alt+E)');
+  // what a screen reader hears on the launcher: the progress it shows, and whether the queue is running
+  function labelLauncher() {
+    const n = state.queue.length, i = state.idx;
+    const where = !n ? '' : state.running && state.waitUntil ? `, waiting out a limit, ${hms(state.waitUntil - Date.now())} left`
+      : state.running ? `, ${i} of ${n} sent, running` : i >= n ? `, all ${n} sent` : i ? `, ${i} of ${n} sent, paused` : `, ${plural(n, 'prompt')} ready`;
+    const label = `Promptline${where} (Alt+E)`;
+    if (toggle.getAttribute('aria-label') !== label) toggle.setAttribute('aria-label', label);
+  }
   toggle.setAttribute('aria-controls', 'pl-panel');
   let badgePulse = null;
 
@@ -842,6 +857,7 @@
     waitClock.textContent = hms(left);
     waitNote.textContent = `Prompt ${state.idx + 1} goes again around ${clock(state.waitUntil)}. Keep this tab open; Pause stops the wait.`;
     toggleCount.textContent = hms(left);
+    labelLauncher();
   }
 
   // The card being generated is the loudest; the next one is quiet but numbered brightly.
@@ -880,6 +896,12 @@
     };
     p.onclick = flip;
     p.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); flip(); } });
+    // text that fits needs no Show more: it stays plain text, not one more stop for Tab and the screen reader
+    requestAnimationFrame(() => {
+      if (!p.isConnected || p.scrollHeight > p.clientHeight + 1) return;
+      p.removeAttribute('role'); p.removeAttribute('aria-expanded'); p.removeAttribute('tabindex'); p.removeAttribute('title');
+      p.style.cursor = ''; p.onclick = null;
+    });
     return p;
   }
 
@@ -890,6 +912,7 @@
     pill.style.display = n ? 'inline-block' : 'none';
     toggleCount.textContent = progress;
     toggleCount.style.display = n ? 'inline' : 'none';
+    labelLauncher();
     toggle.setAttribute('aria-expanded', String(panel.style.display !== 'none'));
     // the play badge breathes while the queue runs
     if (state.running && !badgePulse) badgePulse = pulse(toggleLogo.badge);
@@ -1084,8 +1107,11 @@
   // ---------- panel open, close, tabs, menu ----------
   // the panel grows out of the launcher, and goes back into it quicker
   let panelExit = null;
-  function openPanel(which) {
+  // where focus was before the panel opened, so closing it puts you back there (the chat box, usually)
+  let returnTo = null;
+  function openPanel(which, focusIn = false) {
     const was = tab, opening = panel.style.display === 'none' || !!panelExit;
+    if (opening) { const a = document.activeElement; returnTo = a && a !== document.body && !ours(a) && a !== toggle ? a : null; }
     if (which) tab = which;
     if (sel.on && !sel.busy) setSelect(false);  // one thing at a time: the panel or chat selection
     if (panelExit) { panelExit.cancel(); panelExit = null; }
@@ -1096,8 +1122,15 @@
     if (opening) enter(panel, { y: 10, scale: 0.97, ms: 200, origin: 'bottom right' });
     else if (tab !== was) enter(body, { y: 0, ms: 140 });  // a tab switch: the new view fades in where the old one was
     if (tab === 'library') libSearch.focus();
+    else if (focusIn && opening) tabBtns[tab].focus();  // opened by key or launcher: you land on the section you're in
   }
-  function closePanel() {
+  function closePanel(giveBack = false) {
+    // focus was in the panel: hand it back to where it came from, or to the launcher
+    if (giveBack && (panel.contains(document.activeElement) || document.activeElement === document.body)) {
+      const back = returnTo && returnTo.isConnected && visible(returnTo) ? returnTo : toggle;
+      back.focus();
+    }
+    returnTo = null;
     closeMenu();
     if (panel.style.display === 'none' || panelExit) return;
     const done = () => { panelExit = null; panel.style.display = 'none'; render(); };
@@ -1107,7 +1140,7 @@
     panelExit.onfinish = () => { panelExit.cancel(); done(); };
     toggle.setAttribute('aria-expanded', 'false');
   }
-  function togglePanel() { if (panel.style.display === 'none' || panelExit) openPanel(); else closePanel(); }  // pressed again while closing: it comes back
+  function togglePanel() { if (panel.style.display === 'none' || panelExit) openPanel(undefined, true); else closePanel(true); }  // pressed again while closing: it comes back
   function startOrPause() { bRun.onclick(); }
   function openMenu() { menu.style.display = 'flex'; enter(menu, { y: 4, scale: 0.98, ms: 140, origin: 'bottom right' }); bMore.setAttribute('aria-expanded', 'true'); const f = [...menu.children].find((b) => !b.disabled); if (f) f.focus(); }
   function closeMenu() { if (menu.style.display === 'none') return; menu.style.display = 'none'; bMore.setAttribute('aria-expanded', 'false'); }
@@ -1281,12 +1314,19 @@
       box = tickBox();
       box.style.marginRight = '8px';
       box.dataset.iqBox = '1';
-      box.setAttribute('role', 'checkbox');
+      box.setAttribute('aria-hidden', 'true');
       a.prepend(box);
     }
-    if (!sel.on) { if (box) box.remove(); a.style.boxShadow = ''; a.style.background = ''; return; }
+    // while you pick, each chat in the sidebar is itself a checkbox named by its title (a box inside a link has no name,
+    // and a control inside a link is two controls in one); afterwards it's a plain link again
+    if (!sel.on) {
+      if (box) box.remove();
+      if (a.dataset.iqRole !== undefined) { if (a.dataset.iqRole) a.setAttribute('role', a.dataset.iqRole); else a.removeAttribute('role'); a.removeAttribute('aria-checked'); delete a.dataset.iqRole; }
+      a.style.boxShadow = ''; a.style.background = ''; return;
+    }
+    if (a.dataset.iqRole === undefined) { a.dataset.iqRole = a.getAttribute('role') || ''; a.setAttribute('role', 'checkbox'); }
     // only touch what changed, or the sidebar watcher wakes itself forever
-    if (box.getAttribute('aria-checked') !== String(on)) { box.set(on); box.setAttribute('aria-checked', String(on)); }
+    if (a.getAttribute('aria-checked') !== String(on) || box.dataset.on !== String(on)) { box.set(on); box.dataset.on = String(on); a.setAttribute('aria-checked', String(on)); }
     a.style.boxShadow = on ? `inset 0 0 0 1px ${C.bone}` : '';
     a.style.background = on ? 'rgba(233,225,220,.08)' : '';
   }
@@ -1431,9 +1471,17 @@
     if (e.key === 'Escape') {
       if (menu.style.display !== 'none') { e.stopPropagation(); closeMenu(); bMore.focus(); return; }
       if (sel.on && !sel.busy) { setSelect(false); return; }
-      // Esc closes the panel only when you're working in it, so ChatGPT keeps its own Esc
-      if (panel.style.display !== 'none' && panel.contains(document.activeElement)) { e.stopPropagation(); closePanel(); toggle.focus(); }
+      // Esc closes the panel from anywhere, except where ChatGPT uses Esc itself: its chat box, its fields, its menus and dialogs
+      const a = document.activeElement, mine = panel.contains(a);
+      const pageField = a && !mine && (a.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+      const pageMenu = [...document.querySelectorAll('[role="dialog"], [role="menu"], [role="listbox"]')].some((m) => !ours(m) && visible(m));
+      if (panel.style.display !== 'none' && !panelExit && (mine || (!pageField && !pageMenu))) { e.stopPropagation(); closePanel(true); }
       return;
+    }
+    // in chat selection, Space on a chat ticks it, as on any checkbox (Enter already does, through its click)
+    if (e.key === ' ' && sel.on && !sel.busy && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      const a = e.target.closest && e.target.closest(SEL.chat);
+      if (a && !ours(a)) { e.preventDefault(); e.stopPropagation(); a.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, shiftKey: e.shiftKey })); return; }
     }
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     // the panel is Alt+E (Alt+Q closes windows on some setups)
