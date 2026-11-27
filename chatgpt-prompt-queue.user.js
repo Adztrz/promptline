@@ -2,7 +2,7 @@
 // @name         Promptline
 // @namespace    adztrz
 // @license      MIT
-// @version      3.5.9
+// @version      3.6
 // @description  Queue image prompts in ChatGPT, download each result, wait out limits, batch archive or delete chats, keep a prompt library with pictures, and send your last prompt again.
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -81,8 +81,9 @@
     failedSaves: 0,               // downloads that failed since Start
     note: '',
     bad: false,
+    pausedAt: 0,                  // when the queue last stopped partway; shown with the reason
   };
-  if (GM_getValue('running', false)) state.note = 'Paused because the page reloaded. Press Start to continue.';
+  if (GM_getValue('running', false)) { state.note = 'The page reloaded while it ran.'; state.pausedAt = Date.now(); }
   const save = () => { GM_setValue('queue', state.queue); GM_setValue('idx', state.idx); GM_setValue('got', state.got); GM_setValue('running', state.running); };
 
   const settings = { download: true, png: true, prefix: '', autoResume: true, notify: true, ...GM_getValue('settings', {}) };
@@ -367,7 +368,7 @@
     while (state.running) {
       const idle = await waitIdle();
       if (!state.running) return;
-      if (!idle) return pause('The last reply took too long. Check the page, then press Start.');
+      if (!idle) return pause('The last reply took too long. Check the page first.');
       if (limitHit()) {
         state.limitSeenAt = turnCount();
         // the last prompt got the limit message instead of an image, so it goes again
@@ -409,9 +410,9 @@
     return `Done: ${plural(state.queue.length, 'prompt')} sent${imgs}${failed}.`;
   }
 
+  // stopping partway: the reason and the time go in the pause block, where you look when you come back
   function pause(msg, bad = true) {
-    state.running = false; save(); render();
-    setStatus(msg, bad);
+    state.running = false; state.note = msg; state.bad = bad; state.pausedAt = Date.now(); save(); render();
     if (bad) notify(msg);
   }
   function notify(text) {
@@ -438,8 +439,9 @@
   // Built without innerHTML and styled in JS, so ChatGPT's page rules don't block it.
   const C = {
     canvas: '#07090b', card: '#090b0c', raised: '#1a1d1e', divider: '#262727', border: '#363738', rule: '#696a68',
-    // faint is the quietest text that still reads: 4.6:1 on the card
-    strong: '#efefed', bone: '#e9e1dc', text: '#b3b0af', muted: '#8a8b8a', faint: '#7a7b7a', alert: '#f12614', positive: '#55bc82',
+    // faint is the quietest text that still reads: 5.4:1 on the card, 4.6:1 on raised surfaces (menus, Last sent)
+    // alert is lighter than a pure red so it reads on raised surfaces too: 5.1:1 there
+    strong: '#efefed', bone: '#e9e1dc', text: '#b3b0af', muted: '#8a8b8a', faint: '#858685', alert: '#ff4a36', positive: '#55bc82',
   };
   const SANS = '"Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif';
   const MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
@@ -455,7 +457,7 @@
       .pl-root * { scrollbar-width: thin; scrollbar-color: ${C.border} transparent; }
       .pl-root :focus { outline: none; }
       .pl-root :focus-visible { outline: 2px solid ${C.bone}; outline-offset: 2px; }
-      .pl-root input:focus-visible, .pl-root textarea:focus-visible { outline-offset: 0; border-color: ${C.rule} !important; }
+      .pl-root input:focus-visible, .pl-root textarea:focus-visible { outline-offset: 0; border-color: ${C.bone} !important; }
       @media (max-width: 520px) {
         .pl-panel { left: 8px !important; right: 8px !important; width: auto !important; max-width: none !important; }
         .pl-bar { top: 8px !important; }
@@ -508,12 +510,15 @@
       primary: { background: C.bone, border: `1px solid ${C.bone}`, color: C.canvas, boxShadow: '0 1px 3px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.5)' },
       ghost: { background: 'transparent', border: '1px solid transparent', color: C.muted, padding: '0 8px' },
       danger: { background: 'transparent', border: `1px solid ${C.alert}`, color: C.alert },
+      // a tab: no box of its own; the underline (set in render) marks the open one
+      tab: { background: 'transparent', border: '1px solid transparent', color: C.muted, padding: '0 8px' },
     }[kind];
     const b = el('button', { ...base, ...look }, label);
     b.type = 'button';
     if (kind === 'primary') hover(b, { background: C.strong, borderColor: C.strong }, { background: C.bone, borderColor: C.bone });
     else if (kind === 'ghost') hover(b, { color: C.strong, borderColor: C.border }, () => ({ color: b.active ? C.strong : C.muted, borderColor: 'transparent' }));
-    else if (kind === 'danger') hover(b, { background: 'rgba(241,38,20,.1)' }, { background: 'transparent' });
+    else if (kind === 'danger') hover(b, { background: 'rgba(255,74,54,.1)' }, { background: 'transparent' });
+    else if (kind === 'tab') hover(b, { color: C.strong }, () => ({ color: b.active ? C.strong : C.muted }));
     else hover(b, { borderColor: C.rule, background: 'rgba(255,255,255,.03)' }, { borderColor: C.border, background: 'transparent' });
     return b;
   }
@@ -547,7 +552,7 @@
   const settle = (e, from, to, ms = 600) => e.animate && e.animate([{ boxShadow: from }, { boxShadow: to }], { duration: calm() ? 200 : ms, easing: 'ease-out' });
   const pulse = (e) => e.animate([{ opacity: 1 }, { opacity: .25 }, { opacity: 1 }], { duration: 1600, iterations: Infinity, easing: 'ease-in-out' });
   const fieldStyle = {
-    width: '100%', boxSizing: 'border-box', padding: '0 12px', height: H, borderRadius: '8px', border: `1px solid ${C.border}`,
+    width: '100%', boxSizing: 'border-box', padding: '0 12px', height: H, borderRadius: '8px', border: `1px solid ${C.rule}`,
     background: C.raised, color: C.strong, font: `400 12px/1.55 ${MONO}`, transition: `border-color .15s ${EASE}`,
   };
   function field(tagName, placeholder, label, style) {
@@ -645,9 +650,11 @@
   // header: name, then progress, then the chat-selection mode switch
   const header = el('div', { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px', flex: 'none' });
   const headTag = tag('Promptline');
-  const pill = el('span', { minWidth: '20px', padding: '2px 8px', borderRadius: '9999px', background: 'rgba(255,255,255,.05)', font: `500 11px/1.4 ${MONO}`, color: C.muted, textAlign: 'center', fontVariantNumeric: 'tabular-nums' });
+  const pill = el('span', { minWidth: '20px', padding: '2px 8px', borderRadius: '9999px', background: 'rgba(255,255,255,.05)', font: `500 11px/1.4 ${MONO}`, color: C.muted, textAlign: 'center', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' });
   const bSelect = iconButton(ICON.select, 'Select chats to archive or delete (Alt+X)');
-  header.append(headTag, el('span', { flex: '1' }), pill, bSelect);
+  // what the queue is doing, in the tag language of the cards: Ready, Running, Waiting, Paused, Done
+  const stateSlot = el('span', { display: 'inline-flex' });
+  header.append(headTag, el('span', { flex: '1' }), stateSlot, pill, bSelect);
 
   // today's numbers, under the header
   const todayLine = el('div', { font: `500 12px/1.4 ${MONO}`, color: C.faint, marginBottom: '10px', flex: 'none' });
@@ -659,7 +666,7 @@
   const TABS = ['queue', 'library', 'settings'];
   const tabBtns = {};
   for (const k of TABS) {
-    const b = button(k[0].toUpperCase() + k.slice(1), 'ghost');
+    const b = button(k[0].toUpperCase() + k.slice(1), 'tab');
     Object.assign(b.style, { borderRadius: '6px 6px 0 0', borderBottom: '2px solid transparent', marginBottom: '-1px', height: '34px' });
     b.setAttribute('role', 'tab'); b.id = `pl-tab-${k}`; b.setAttribute('aria-controls', `pl-view-${k}`);
     tabBtns[k] = b;
@@ -725,7 +732,14 @@
   const mClear = menuItem('Clear queue', 'Remove every prompt (you can undo)');
   mClear.style.color = C.alert;
   row.append(bRun, bSkip, el('span', { flex: '1' }), bMore, menu);
-  queueView.append(list, status, row);
+  // paused partway: what stopped it, when, and where Resume picks up. It takes the status line's place.
+  const pauseBox = el('div', { display: 'none', flex: 'none', margin: '12px 0', padding: '10px 12px', borderRadius: '8px', background: C.raised, boxShadow: `inset 0 0 0 1px ${C.divider}` });
+  pauseBox.setAttribute('role', 'status');
+  const pauseHead = el('div', { display: 'flex' });
+  const pauseWhy = el('div', { fontSize: '12px', lineHeight: '1.45', color: C.text, marginTop: '6px' });
+  const pauseNext = el('div', { fontSize: '12px', lineHeight: '1.45', color: C.muted });
+  pauseBox.append(pauseHead, pauseWhy, pauseNext);
+  queueView.append(list, pauseBox, status, row);
   queueTab.append(waitBox, editView, queueView);
 
   // library: saved prompts to insert into the chat box or add to the queue
@@ -867,7 +881,7 @@
     const li = el('li', {
       display: 'grid', gridTemplateColumns: '28px 1fr', gap: '4px 10px', padding: '12px 14px', borderRadius: '8px',
       background: working ? C.raised : C.card, boxShadow: `inset 0 0 0 1px ${working ? C.bone : C.divider}`,
-      opacity: sent && !working ? '.6' : '1', transition: `opacity .2s ${EASE}, box-shadow .2s ${EASE}`,
+      transition: `box-shadow .2s ${EASE}`,
     });
     const num = el('span', { gridRow: 'span 2', font: `500 12px/18px ${MONO}`, color: working || next ? C.strong : C.faint, fontVariantNumeric: 'tabular-nums' }, String(i + 1).padStart(2, '0'));
     const label = working ? tag('Generating', C.bone, C.strong)
@@ -908,7 +922,7 @@
   function render() {
     const n = state.queue.length;
     const progress = n ? `${state.idx}/${n}` : '';
-    pill.textContent = progress;
+    pill.textContent = n ? `${state.idx}/${n} sent` : '';
     pill.style.display = n ? 'inline-block' : 'none';
     toggleCount.textContent = progress;
     toggleCount.style.display = n ? 'inline' : 'none';
@@ -978,7 +992,25 @@
     bSkip.disabled = state.running || done;
     mEdit.disabled = mClear.disabled = state.running || !n;
     dim(bLoad, bRun, bSkip, mEdit, mClear);
-    setStatus(state.note || (n && done ? `Done: ${plural(n, 'prompt')} sent.` : n ? 'Ready. Leave the chat box alone while it runs.' : ''), state.bad);
+    const paused = !!n && !state.running && !done && (state.idx > 0 || !!state.pausedAt);
+    const now = !n ? null : state.running && state.waitUntil ? ['Waiting', C.bone] : state.running ? ['Running', C.positive]
+      : done ? ['Done', C.positive] : paused ? ['Paused', state.bad ? C.alert : C.bone] : ['Ready', C.faint];
+    const key = now ? now.join() : '';
+    if (stateSlot.dataset.key !== key) {
+      stateSlot.dataset.key = key;
+      stateSlot.replaceChildren(...(now ? [tag(now[0], now[1], C.text)] : []));
+      if (now && panel.style.display !== 'none') enter(stateSlot.firstChild, { y: 2, ms: 160 });
+    }
+    pauseBox.style.display = paused ? 'block' : 'none';
+    status.style.display = paused ? 'none' : '';
+    if (paused) {
+      const at = String(state.idx + 1).padStart(2, '0');
+      pauseHead.replaceChildren(tag(`Paused before ${at}${state.pausedAt ? ` · ${clock(state.pausedAt)}` : ''}`, state.bad ? C.alert : C.bone, C.strong));
+      pauseWhy.textContent = state.note;
+      pauseWhy.style.display = state.note ? '' : 'none';
+      pauseWhy.style.color = state.bad ? C.alert : C.text;
+      pauseNext.textContent = `${state.idx > 0 ? 'Resume' : 'Start'} carries on from prompt ${state.idx + 1} of ${n}.`;
+    } else setStatus(state.note || (n && done ? `Done: ${plural(n, 'prompt')} sent.` : state.running ? 'Leave the chat box alone while it runs.' : n ? 'Press Start, then leave the chat box alone while it runs.' : ''), state.bad);
     renderWait();
     renderToday();
     paintPrefix();
@@ -1097,7 +1129,7 @@
   function addToQueue(text, ids = []) {
     const l = text ? parse(text) : [''];
     const fresh = !state.queue.length || state.idx >= state.queue.length;
-    if (fresh) { state.queue = []; state.idx = 0; state.got = []; state.note = ''; }
+    if (fresh) { state.queue = []; state.idx = 0; state.got = []; state.note = ''; state.pausedAt = 0; }
     state.queue.push(...l.map((t) => qItem(t, ids))); save();
     editing = false;
     libSay(fresh ? `Started a new queue with ${plural(l.length, 'prompt')}.` : `Added ${plural(l.length, 'prompt')} to the end of the queue (now ${state.queue.length}).`);
@@ -1167,7 +1199,7 @@
   bLoad.onclick = () => {
     const l = parse(area.value);
     if (!l.length) return;
-    state.queue = l.map((t) => qItem(t, editPics.get(t))); editPics = new Map(); state.idx = 0; state.got = []; state.note = ''; save();
+    state.queue = l.map((t) => qItem(t, editPics.get(t))); editPics = new Map(); state.idx = 0; state.got = []; state.note = ''; state.pausedAt = 0; save();
     editing = false; undoStrip.style.display = 'none'; render();
     setStatus(`Loaded ${plural(l.length, 'prompt')}. Press Start.`);
   };
@@ -1181,9 +1213,9 @@
     area.value = rest.map(qText).join('\n'); editing = true; render(); area.focus();
   };
   bRun.onclick = () => {
-    if (state.running) return pause('Paused. Press Resume to continue from the next prompt.', false);
+    if (state.running) return pause('You paused it.', false);
     if (state.idx >= state.queue.length) return;
-    state.running = true; save(); render();
+    state.running = true; state.pausedAt = 0; state.note = ''; save(); render();
     setStatus('Starting…');
     run().catch((e) => pause(`Stopped: ${e && e.message ? e.message : e}`));
   };
@@ -1194,7 +1226,7 @@
     closeMenu();
     if (state.running || !state.queue.length) return;
     cleared = { queue: state.queue, idx: state.idx, got: state.got };
-    state.queue = []; state.idx = 0; state.got = []; state.note = ''; save(); area.value = ''; editing = true;
+    state.queue = []; state.idx = 0; state.got = []; state.note = ''; state.pausedAt = 0; save(); area.value = ''; editing = true;
     undoText.textContent = `Cleared ${plural(cleared.queue.length, 'prompt')}.`;
     undoStrip.style.display = 'flex';
     clearTimeout(undoTimer);
